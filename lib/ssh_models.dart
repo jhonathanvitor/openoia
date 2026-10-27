@@ -453,12 +453,28 @@ else:
     // 1. Key (Chave Privada)
     if (host.enabledExtras.contains('privateKey')) {
       if (host.privateKeyContent.trim().isNotEmpty) {
-        final outKey = File('${runDir.path}/pasted_${host.id}.pem');
-        String content = host.privateKeyContent.trim();
-        if (!content.endsWith('\n')) content += '\n';
-        outKey.writeAsStringSync(content);
-        Process.runSync('chmod', ['600', outKey.path]);
-        files.add(outKey.path);
+        final content = host.privateKeyContent.trim();
+        if (content.startsWith('PuTTY-User-Key-File')) {
+          final tempPpk = File('${runDir.path}/tmp_pasted_${host.id}.ppk');
+          tempPpk.writeAsStringSync('$content\n');
+          final k = await _convertOrCopyKeyFile(
+            tempPpk.path,
+            host.id,
+            'pasted_ppk',
+            secret,
+          );
+          try {
+            if (tempPpk.existsSync()) tempPpk.deleteSync();
+          } catch (_) {}
+          if (k != null) files.add(k);
+        } else {
+          final outKey = File('${runDir.path}/pasted_${host.id}.pem');
+          String outContent = content;
+          if (!outContent.endsWith('\n')) outContent += '\n';
+          outKey.writeAsStringSync(outContent);
+          Process.runSync('chmod', ['600', outKey.path]);
+          files.add(outKey.path);
+        }
       } else if (host.privateKeyPath.trim().isNotEmpty) {
         final k = await _convertOrCopyKeyFile(
           host.privateKeyPath.trim(),
