@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'db_workspace_page.dart';
 import 'secure_storage.dart';
 import 'ssh_workspace_page.dart';
 
@@ -178,7 +179,7 @@ class _VpnDashboardPageState extends State<VpnDashboardPage> {
   @override
   void dispose() {
     _clockTimer?.cancel();
-    _disconnectVpn();
+    _disconnectVpn(isDisposing: true);
     _ovpnCtrl.dispose();
     _userCtrl.dispose();
     _passCtrl.dispose();
@@ -829,21 +830,26 @@ exec "$HELPER_PATH" --connect "$GUI_PID"
     _saveHistory();
   }
 
-  void _disconnectVpn() {
+  void _disconnectVpn({bool isDisposing = false}) {
     _userRequestedStop = true;
-    _appendLog('Encerrando conexão VPN...');
-    try {
-      final cleanEnv = Map<String, String>.from(Platform.environment)
-        ..remove('LD_LIBRARY_PATH')
-        ..remove('PYTHONHOME')
-        ..remove('PYTHONPATH');
-      Process.run(
-        'sudo',
-        ['-n', '/usr/local/bin/vpn-openoia-root-helper', '--disconnect'],
-        environment: cleanEnv,
-      );
-      _vpnProcess?.kill(ProcessSignal.sigterm);
-    } catch (_) {}
+    if (!isDisposing) {
+      _appendLog('Encerrando conexão VPN...');
+    }
+    if (_vpnProcess != null) {
+      try {
+        final cleanEnv = Map<String, String>.from(Platform.environment)
+          ..remove('LD_LIBRARY_PATH')
+          ..remove('PYTHONHOME')
+          ..remove('PYTHONPATH');
+        Process.runSync(
+          'sudo',
+          ['-n', '/usr/local/bin/vpn-openoia-root-helper', '--disconnect'],
+          environment: cleanEnv,
+        );
+        _vpnProcess?.kill(ProcessSignal.sigterm);
+        _vpnProcess = null;
+      } catch (_) {}
+    }
   }
 
   @override
@@ -943,6 +949,10 @@ exec "$HELPER_PATH" --connect "$GUI_PID"
                   isDark: isDark,
                   configDir: _configDir,
                 ),
+                DbWorkspacePage(
+                  isDark: isDark,
+                  configDir: _configDir,
+                ),
               ],
             ),
           ),
@@ -975,7 +985,7 @@ exec "$HELPER_PATH" --connect "$GUI_PID"
     }
 
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 16),
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: const BoxDecoration(
         gradient: LinearGradient(
           colors: [Color(0xFF0A3D22), Color(0xFF146C3B), Color(0xFF1B8A4C)],
@@ -1051,10 +1061,12 @@ exec "$HELPER_PATH" --connect "$GUI_PID"
                 ),
                 SizedBox(height: 2),
                 Text(
-                  'Cliente OpenVPN + Terminal SSH & SFTP Integrado',
+                  'Cliente OpenVPN + SSH & SFTP + DataBase Studio',
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                     color: Color(0xFFD1FAE5),
-                    fontSize: 12.5,
+                    fontSize: 12,
                   ),
                 ),
               ],
@@ -1080,6 +1092,12 @@ exec "$HELPER_PATH" --connect "$GUI_PID"
                   index: 1,
                   icon: Icons.terminal_rounded,
                   label: 'SSH & SFTP',
+                ),
+                const SizedBox(width: 4),
+                _buildModuleSwitchButton(
+                  index: 2,
+                  icon: Icons.storage_rounded,
+                  label: 'DataBase',
                 ),
               ],
             ),
@@ -1145,7 +1163,7 @@ exec "$HELPER_PATH" --connect "$GUI_PID"
       borderRadius: BorderRadius.circular(9),
       onTap: () => setState(() => _selectedMainModule = index),
       child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
           color: active ? Colors.white : Colors.transparent,
           borderRadius: BorderRadius.circular(9),
