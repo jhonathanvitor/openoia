@@ -94,5 +94,28 @@ void main() {
       expect(client.host, 'localhost');
       expect(client.port, 5432);
     });
+
+    test('TableForeignKey properties and serialization', () {
+      const fk = TableForeignKey(
+        constraintName: 'fk_pedidos_usuario',
+        fromSchema: 'public',
+        fromTable: 'pedidos',
+        fromColumn: 'usuario_id',
+        toSchema: 'public',
+        toTable: 'usuarios',
+        toColumn: 'id',
+      );
+
+      expect(fk.constraintName, 'fk_pedidos_usuario');
+      expect(fk.fromTable, 'pedidos');
+      expect(fk.fromColumn, 'usuario_id');
+      expect(fk.toTable, 'usuarios');
+      expect(fk.toColumn, 'id');
+
+      final json = fk.toJson();
+      expect(json['constraintName'], 'fk_pedidos_usuario');
+      expect(json['fromColumn'], 'usuario_id');
+      expect(json['toTable'], 'usuarios');
+    });
   });
 }

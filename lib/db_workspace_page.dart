@@ -16,32 +16,65 @@ abstract class DbWorkspaceTab {
   DbWorkspaceTab({required this.id, required this.title, required this.icon});
 }
 
+class SqlSuggestion {
+  final String label;
+  final String insertText;
+  final String category;
+  final IconData icon;
+  final Color color;
+
+  const SqlSuggestion({
+    required this.label,
+    required this.insertText,
+    required this.category,
+    required this.icon,
+    required this.color,
+  });
+}
+
 class QueryTabItem extends DbWorkspaceTab {
   final TextEditingController sqlController;
-  DbQueryResult? result;
-  bool isRunning;
-  int pageIndex;
-  int pageSize;
-  String tableSearchFilter;
+  final ScrollController verticalScroll = ScrollController();
+  final ScrollController horizontalScroll = ScrollController();
+  List<DbQueryResult> results = [];
+  int selectedResultIndex = 0;
+  bool isRunning = false;
+  int pageIndex = 0;
+  int pageSize = 50;
+  String tableSearchFilter = '';
+  String? filePath;
+  bool isDirty = false;
+  String selectedSchema;
+  List<SqlSuggestion> currentSuggestions = [];
+
+  DbQueryResult? get currentResult =>
+      (results.isNotEmpty && selectedResultIndex < results.length) ? results[selectedResultIndex] : null;
+  DbQueryResult? get result => currentResult;
 
   QueryTabItem({
     required super.id,
     required super.title,
     String initialSql = '',
+    this.filePath,
+    this.selectedSchema = '',
   })  : sqlController = TextEditingController(text: initialSql),
-        isRunning = false,
-        pageIndex = 0,
-        pageSize = 50,
-        tableSearchFilter = '',
         super(icon: Icons.code_rounded);
+}
+
+class _SaveSqlIntent extends Intent {
+  const _SaveSqlIntent();
 }
 
 class TableTabItem extends DbWorkspaceTab {
   final String schema;
   final String tableName;
-  int subTabIndex; // 0: Dados, 1: Estrutura, 2: DDL
+  final ScrollController verticalScroll = ScrollController();
+  final ScrollController horizontalScroll = ScrollController();
+  int subTabIndex; // 0: Dados, 1: Estrutura, 2: FKs, 3: DDL
   DbQueryResult? dataResult;
   List<TableColumnMetadata>? columns;
+  List<TableForeignKey> foreignKeys = [];
+  List<TableForeignKey> referencingKeys = [];
   String? ddl;
   bool isLoading;
   int pageIndex;
@@ -88,13 +121,17 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
   Process? _activeTunnelProcess;
   bool _isConnecting = false;
 
-  // Metadata tree
+  // Metadata tree (DBeaver style)
   List<String> _schemas = [];
   String _selectedSchema = '';
-  List<String> _tables = [];
-  String _tableSearchQuery = '';
+  final Set<String> _expandedDatabases = {};
+  final Set<String> _expandedFolders = {}; // Keys: "$schema:tables", "$schema:views", "$schema:functions"
+  final Map<String, List<String>> _databaseTables = {};
+  final Map<String, List<String>> _databaseViews = {};
+  final Map<String, List<String>> _databaseFunctions = {};
   final Map<String, List<TableColumnMetadata>> _tableColumnsCache = {};
-  final Set<String> _expandedTables = {};
+  final Set<String> _expandedTables = {}; // Keys: "$schema:$table"
+  String _treeSearchQuery = '';
 
   // Workspace Tabs
   final List<DbWorkspaceTab> _tabs = [];
@@ -111,11 +148,20 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
 
     _loadSshHosts();
     _loadConnections();
-    _addNewQueryTab();
   }
 
   @override
   void dispose() {
+    for (final tab in _tabs) {
+      if (tab is QueryTabItem) {
+        tab.sqlController.dispose();
+        tab.verticalScroll.dispose();
+        tab.horizontalScroll.dispose();
+      } else if (tab is TableTabItem) {
+        tab.verticalScroll.dispose();
+        tab.horizontalScroll.dispose();
+      }
+    }
     _disconnectActive();
     _tunnelManager.closeAll();
     super.dispose();
@@ -163,13 +209,15 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
     _vault.writeEncryptedJson(_connectionsFile, list);
   }
 
-  void _addNewQueryTab({String initialSql = ''}) {
-    final title = 'Query $_queryCounter.sql';
-    _queryCounter++;
+  void _addNewQueryTab({String initialSql = '', String? schema, String? filePath}) {
+    final title = filePath != null ? filePath.split('/').last : 'Query $_queryCounter.sql';
+    if (filePath == null) _queryCounter++;
     final tab = QueryTabItem(
       id: 'query_${DateTime.now().microsecondsSinceEpoch}',
       title: title,
       initialSql: initialSql.isEmpty ? '-- Escreva sua consulta SQL e pressione Ctrl+Enter ou clique em Executar\n' : initialSql,
+      filePath: filePath,
+      selectedSchema: schema ?? _selectedSchema,
     );
     setState(() {
       _tabs.add(tab);
@@ -179,10 +227,19 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
 
   void _closeTab(int index) {
     if (index < 0 || index >= _tabs.length) return;
+    final tab = _tabs[index];
+    if (tab is QueryTabItem) {
+      tab.sqlController.dispose();
+      tab.verticalScroll.dispose();
+      tab.horizontalScroll.dispose();
+    } else if (tab is TableTabItem) {
+      tab.verticalScroll.dispose();
+      tab.horizontalScroll.dispose();
+    }
     setState(() {
       _tabs.removeAt(index);
       if (_tabs.isEmpty) {
-        _addNewQueryTab();
+        _activeTabIndex = 0;
       } else if (_activeTabIndex >= _tabs.length) {
         _activeTabIndex = _tabs.length - 1;
       }
@@ -227,11 +284,26 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
       await client.connect();
       _activeClient = client;
 
-      // Load schemas and tables
+      // Load databases / schemas (DBeaver style)
       _schemas = await client.listSchemas();
-      if (_schemas.isEmpty) _schemas = ['public'];
-      _selectedSchema = _schemas.contains('public') ? 'public' : _schemas.first;
-      await _refreshTables();
+      if (_schemas.isEmpty) {
+        _schemas = [conn.databaseName.isNotEmpty ? conn.databaseName : 'public'];
+      }
+      _selectedSchema = conn.databaseName.isNotEmpty && _schemas.contains(conn.databaseName)
+          ? conn.databaseName
+          : (_schemas.contains('public') ? 'public' : _schemas.first);
+
+      _expandedDatabases.clear();
+      _expandedFolders.clear();
+      _databaseTables.clear();
+      _databaseViews.clear();
+      _databaseFunctions.clear();
+      _tableColumnsCache.clear();
+      _expandedTables.clear();
+
+      _expandedDatabases.add(_selectedSchema);
+      _expandedFolders.add('$_selectedSchema:tables');
+      await _loadSchemaContent(_selectedSchema);
 
       if (mounted) {
         setState(() => _isConnecting = false);
@@ -240,7 +312,17 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
       await _disconnectActive();
       if (mounted) {
         setState(() => _isConnecting = false);
-        _showErrorDialog('Falha na Conexão', e.toString());
+        final errStr = e.toString();
+        String msg;
+        if (e is SocketException || errStr.contains('SocketException') || errStr.contains('errno = 111')) {
+          msg = 'Não foi possível conectar em ${conn.host}:${conn.port} (Conexão recusada).\n\n'
+                '• Verifique se o serviço do banco de dados está ativo.\n'
+                '• Confirme se a porta ${conn.port} está correta (no Docker, veja a porta mapeada no host).\n'
+                '• Se estiver usando banco local sem SSH, desative a opção "Túnel SSH Integrado".';
+        } else {
+          msg = errStr;
+        }
+        _showErrorDialog('Falha na Conexão', msg);
       }
     }
   }
@@ -260,26 +342,58 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
       setState(() {
         _activeConnection = null;
         _schemas.clear();
-        _tables.clear();
+        _expandedDatabases.clear();
+        _expandedFolders.clear();
+        _databaseTables.clear();
+        _databaseViews.clear();
+        _databaseFunctions.clear();
         _tableColumnsCache.clear();
         _expandedTables.clear();
       });
     }
   }
 
-  Future<void> _refreshTables() async {
+  Future<void> _loadSchemaContent(String schema) async {
     if (_activeClient == null) return;
     try {
-      final t = await _activeClient!.listTables(schema: _selectedSchema);
+      final tables = await _activeClient!.listTables(schema: schema);
+      final views = await _activeClient!.listViews(schema: schema);
+      final functions = await _activeClient!.listFunctions(schema: schema);
       if (mounted) {
-        setState(() => _tables = t);
+        setState(() {
+          _databaseTables[schema] = tables;
+          _databaseViews[schema] = views;
+          _databaseFunctions[schema] = functions;
+        });
       }
     } catch (_) {}
   }
 
-  Future<void> _openTableTab(String table) async {
+  Future<void> _refreshTree() async {
+    if (_activeClient == null) return;
+    try {
+      _schemas = await _activeClient!.listSchemas();
+      if (_schemas.isEmpty) {
+        _schemas = [_activeConnection?.databaseName.isNotEmpty == true ? _activeConnection!.databaseName : 'public'];
+      }
+      _databaseTables.clear();
+      _databaseViews.clear();
+      _databaseFunctions.clear();
+      _tableColumnsCache.clear();
+      if (_selectedSchema.isEmpty || !_schemas.contains(_selectedSchema)) {
+        _selectedSchema = _schemas.first;
+      }
+      _expandedDatabases.add(_selectedSchema);
+      _expandedFolders.add('$_selectedSchema:tables');
+      await _loadSchemaContent(_selectedSchema);
+      if (mounted) setState(() {});
+    } catch (_) {}
+  }
+
+  Future<void> _openTableTab(String table, {String? schema}) async {
+    final sch = schema ?? _selectedSchema;
     final existingIdx = _tabs.indexWhere(
-      (t) => t is TableTabItem && t.tableName == table && t.schema == _selectedSchema,
+      (t) => t is TableTabItem && t.tableName == table && t.schema == sch,
     );
     if (existingIdx >= 0) {
       setState(() => _activeTabIndex = existingIdx);
@@ -287,8 +401,8 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
     }
 
     final tab = TableTabItem(
-      id: 'table_${_selectedSchema}_$table',
-      schema: _selectedSchema,
+      id: 'table_${sch}_$table',
+      schema: sch,
       tableName: table,
     );
 
@@ -300,20 +414,35 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
     await _loadTableData(tab);
   }
 
-  Future<void> _loadTableData(TableTabItem tab) async {
+  String _formatTableName(String schema, String table) {
+    if (_activeConnection?.engine == DbEngine.mysql) {
+      return '`$schema`.`$table`';
+    } else if (_activeConnection?.engine == DbEngine.sqlserver) {
+      return '[$schema].[$table]';
+    }
+    return '"$schema"."$table"';
+  }
+
+  Future<void> _loadTableData(TableTabItem tab, {int limit = 1000}) async {
     if (_activeClient == null) return;
     setState(() => tab.isLoading = true);
 
     try {
-      final query = 'SELECT * FROM ${_formatTableName(tab.schema, tab.tableName)} LIMIT 200;';
-      final res = await _activeClient!.executeQuery(query);
+      final query = _activeConnection?.engine == DbEngine.sqlserver
+          ? 'SELECT TOP $limit * FROM ${_formatTableName(tab.schema, tab.tableName)};'
+          : 'SELECT * FROM ${_formatTableName(tab.schema, tab.tableName)} LIMIT $limit;';
+      final res = await _activeClient!.executeQuery(query, maxRows: limit);
       final cols = await _activeClient!.getTableColumns(tab.tableName, schema: tab.schema);
+      final fks = await _activeClient!.getTableForeignKeys(tab.tableName, schema: tab.schema);
+      final refFks = await _activeClient!.getReferencingForeignKeys(tab.tableName, schema: tab.schema);
       final ddl = await _activeClient!.getTableDdl(tab.tableName, schema: tab.schema);
 
       if (mounted) {
         setState(() {
           tab.dataResult = res;
           tab.columns = cols;
+          tab.foreignKeys = fks;
+          tab.referencingKeys = refFks;
           tab.ddl = ddl;
           tab.isLoading = false;
         });
@@ -328,13 +457,420 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
     }
   }
 
-  String _formatTableName(String schema, String table) {
-    if (_activeConnection?.engine == DbEngine.mysql) {
-      return '`$table`';
-    } else if (_activeConnection?.engine == DbEngine.sqlserver) {
-      return '[$schema].[$table]';
+  void _navigateForeignKey(String toSchema, String toTable, String toColumn, dynamic value) {
+    if (value == null) return;
+    final valStr = value.toString().replaceAll("'", "''");
+    final target = _formatTableName(toSchema, toTable);
+    final sql = "-- Navegação por Chave Estrangeira: $toTable ($toColumn = $valStr)\nSELECT * FROM $target WHERE $toColumn = '$valStr';\n";
+    _addNewQueryTab(initialSql: sql, schema: toSchema);
+    final newTab = _tabs.last as QueryTabItem;
+    _executeQuery(newTab);
+  }
+
+  void _navigateReferencingTable(String fromSchema, String fromTable, String fromColumn, dynamic value) {
+    if (value == null) return;
+    final valStr = value.toString().replaceAll("'", "''");
+    final target = _formatTableName(fromSchema, fromTable);
+    final sql = "-- Registros Dependentes: $fromTable ($fromColumn = $valStr)\nSELECT * FROM $target WHERE $fromColumn = '$valStr';\n";
+    _addNewQueryTab(initialSql: sql, schema: fromSchema);
+    final newTab = _tabs.last as QueryTabItem;
+    _executeQuery(newTab);
+  }
+
+  void _selectTop1000(String schema, String table) {
+    final formattedTable = _formatTableName(schema, table);
+    final sql = _activeConnection?.engine == DbEngine.sqlserver
+        ? 'SELECT TOP 1000 * FROM $formattedTable;\n'
+        : 'SELECT * FROM $formattedTable LIMIT 1000;\n';
+    _addNewQueryTab(initialSql: sql);
+    final newTab = _tabs.last as QueryTabItem;
+    _executeQuery(newTab);
+  }
+
+  void _countRecords(String schema, String table) {
+    final formattedTable = _formatTableName(schema, table);
+    final sql = 'SELECT COUNT(*) AS total_registros FROM $formattedTable;\n';
+    _addNewQueryTab(initialSql: sql);
+    final newTab = _tabs.last as QueryTabItem;
+    _executeQuery(newTab);
+  }
+
+  void _showTableContextMenu(BuildContext context, Offset position, String schema, String table, {bool isView = false}) {
+    final textStyle = TextStyle(fontSize: 12.5, color: widget.isDark ? Colors.white : Colors.black87);
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx + 1, position.dy + 1),
+      items: [
+        PopupMenuItem(
+          value: 'select_1000',
+          child: Row(
+            children: [
+              const Icon(Icons.table_rows_rounded, size: 16, color: Color(0xFF10B981)),
+              const SizedBox(width: 8),
+              Text('Selecionar os primeiros 1.000 dados', style: textStyle),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'count',
+          child: Row(
+            children: [
+              const Icon(Icons.calculate_outlined, size: 16, color: Color(0xFF38BDF8)),
+              const SizedBox(width: 8),
+              Text('Contar Registros (COUNT)', style: textStyle),
+            ],
+          ),
+        ),
+        if (!isView)
+          PopupMenuItem(
+            value: 'open_tab',
+            child: Row(
+              children: [
+                const Icon(Icons.schema_rounded, size: 16, color: Color(0xFF818CF8)),
+                const SizedBox(width: 8),
+                Text('Abrir Tabela & Estrutura', style: textStyle),
+              ],
+            ),
+          ),
+        PopupMenuItem(
+          value: 'new_query',
+          child: Row(
+            children: [
+              const Icon(Icons.edit_note_rounded, size: 16, color: Color(0xFFF59E0B)),
+              const SizedBox(width: 8),
+              Text('Nova Consulta SQL nesta ${isView ? 'view' : 'tabela'}', style: textStyle),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: 'copy_name',
+          child: Row(
+            children: [
+              const Icon(Icons.copy_rounded, size: 16, color: Colors.grey),
+              const SizedBox(width: 8),
+              Text('Copiar Nome', style: textStyle),
+            ],
+          ),
+        ),
+      ],
+    ).then((val) {
+      if (val == 'select_1000') {
+        _selectTop1000(schema, table);
+      } else if (val == 'count') {
+        _countRecords(schema, table);
+      } else if (val == 'open_tab') {
+        _openTableTab(table, schema: schema);
+      } else if (val == 'new_query') {
+        _addNewQueryTab(initialSql: 'SELECT * FROM ${_formatTableName(schema, table)} WHERE 1=1;\n');
+      } else if (val == 'copy_name') {
+        Clipboard.setData(ClipboardData(text: table));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Nome "$table" copiado!')),
+          );
+        }
+      }
+    });
+  }
+
+  void _showDatabaseContextMenu(BuildContext context, Offset position, String schema) {
+    final textStyle = TextStyle(fontSize: 12.5, color: widget.isDark ? Colors.white : Colors.black87);
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx + 1, position.dy + 1),
+      items: [
+        PopupMenuItem(
+          value: 'new_query',
+          child: Row(
+            children: [
+              const Icon(Icons.post_add_rounded, size: 16, color: Color(0xFF10B981)),
+              const SizedBox(width: 8),
+              Text('Nova Consulta SQL em "$schema"', style: textStyle),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'refresh',
+          child: Row(
+            children: [
+              const Icon(Icons.refresh_rounded, size: 16, color: Color(0xFF38BDF8)),
+              const SizedBox(width: 8),
+              Text('Recarregar Banco', style: textStyle),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: 'copy_name',
+          child: Row(
+            children: [
+              const Icon(Icons.copy_rounded, size: 16, color: Colors.grey),
+              const SizedBox(width: 8),
+              Text('Copiar Nome do Banco', style: textStyle),
+            ],
+          ),
+        ),
+      ],
+    ).then((val) {
+      if (val == 'new_query') {
+        final initialSql = _activeConnection?.engine == DbEngine.mysql
+            ? 'USE `$schema`;\n\n'
+            : (_activeConnection?.engine == DbEngine.sqlserver ? 'USE [$schema];\n\n' : '-- Esquema: $schema\n\n');
+        _addNewQueryTab(initialSql: initialSql, schema: schema);
+      } else if (val == 'refresh') {
+        _loadSchemaContent(schema);
+      } else if (val == 'copy_name') {
+        Clipboard.setData(ClipboardData(text: schema));
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Nome "$schema" copiado!')),
+          );
+        }
+      }
+    });
+  }
+
+  void _showQueryTabContextMenu(BuildContext context, Offset position, QueryTabItem tab, int index) {
+    final textStyle = TextStyle(fontSize: 12.5, color: widget.isDark ? Colors.white : Colors.black87);
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx + 1, position.dy + 1),
+      items: [
+        PopupMenuItem(
+          value: 'save',
+          child: Row(
+            children: [
+              const Icon(Icons.save_rounded, size: 16, color: Color(0xFF10B981)),
+              const SizedBox(width: 8),
+              Text(tab.filePath != null ? 'Salvar (${tab.title})' : 'Salvar Consulta (.sql)', style: textStyle),
+            ],
+          ),
+        ),
+        PopupMenuItem(
+          value: 'save_as',
+          child: Row(
+            children: [
+              const Icon(Icons.save_as_rounded, size: 16, color: Color(0xFF38BDF8)),
+              const SizedBox(width: 8),
+              Text('Salvar Como...', style: textStyle),
+            ],
+          ),
+        ),
+        const PopupMenuDivider(),
+        PopupMenuItem(
+          value: 'close',
+          child: Row(
+            children: [
+              const Icon(Icons.close_rounded, size: 16, color: Color(0xFFEF4444)),
+              const SizedBox(width: 8),
+              Text('Fechar Aba', style: textStyle),
+            ],
+          ),
+        ),
+      ],
+    ).then((val) {
+      if (val == 'save') {
+        _saveQueryTab(tab);
+      } else if (val == 'save_as') {
+        _saveQueryTabAs(tab);
+      } else if (val == 'close') {
+        _closeTab(index);
+      }
+    });
+  }
+
+  Future<void> _saveQueryTab(QueryTabItem tab) async {
+    if (tab.filePath != null) {
+      try {
+        final f = File(tab.filePath!);
+        await f.writeAsString(tab.sqlController.text);
+        setState(() {
+          tab.isDirty = false;
+          tab.title = tab.filePath!.split('/').last;
+        });
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Consulta salva em ${tab.filePath}!')),
+          );
+        }
+        return;
+      } catch (_) {}
     }
-    return '"$schema"."$table"';
+    await _saveQueryTabAs(tab);
+  }
+
+  Future<void> _saveQueryTabAs(QueryTabItem tab) async {
+    try {
+      final defaultName = tab.title.replaceAll('*', '').trim().isEmpty ? 'consulta.sql' : tab.title.replaceAll('*', '').trim();
+      final res = await Process.run('zenity', [
+        '--file-selection',
+        '--save',
+        '--confirm-overwrite',
+        '--title=Salvar Consulta SQL',
+        '--filename=$defaultName',
+        '--file-filter=Arquivos SQL (*.sql) | *.sql',
+      ]);
+      if (res.exitCode == 0) {
+        String chosen = res.stdout.toString().trim();
+        if (chosen.isNotEmpty) {
+          if (!chosen.endsWith('.sql')) chosen += '.sql';
+          final f = File(chosen);
+          await f.writeAsString(tab.sqlController.text);
+          setState(() {
+            tab.filePath = chosen;
+            tab.isDirty = false;
+            tab.title = chosen.split('/').last;
+          });
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Consulta salva em $chosen!')),
+            );
+          }
+        }
+      }
+    } catch (e) {
+      if (mounted) _showErrorDialog('Erro ao Salvar', e.toString());
+    }
+  }
+
+  Future<void> _openQueryFromFile() async {
+    try {
+      final res = await Process.run('zenity', [
+        '--file-selection',
+        '--title=Abrir Consulta SQL',
+        '--file-filter=Arquivos SQL (*.sql) | *.sql',
+      ]);
+      if (res.exitCode == 0) {
+        final chosen = res.stdout.toString().trim();
+        if (chosen.isNotEmpty) {
+          final f = File(chosen);
+          if (f.existsSync()) {
+            final content = await f.readAsString();
+            _addNewQueryTab(initialSql: content, filePath: chosen);
+          }
+        }
+      }
+    } catch (e) {
+      if (mounted) _showErrorDialog('Erro ao Abrir', e.toString());
+    }
+  }
+
+  List<String> _splitSqlStatements(String sql) => splitSqlStatements(sql);
+
+  void _onSqlTextChanged(QueryTabItem tab) {
+    if (!tab.isDirty) {
+      setState(() {
+        tab.isDirty = true;
+        if (!tab.title.endsWith('*')) tab.title = '${tab.title}*';
+      });
+    }
+
+    final text = tab.sqlController.text;
+    final sel = tab.sqlController.selection;
+    if (sel.baseOffset <= 0 || sel.baseOffset > text.length) {
+      if (tab.currentSuggestions.isNotEmpty) setState(() => tab.currentSuggestions = []);
+      return;
+    }
+
+    final beforeCursor = text.substring(0, sel.baseOffset);
+    final match = RegExp(r'[a-zA-Z0-9_]+$').firstMatch(beforeCursor);
+    if (match == null || match.group(0) == null || match.group(0)!.isEmpty) {
+      if (tab.currentSuggestions.isNotEmpty) setState(() => tab.currentSuggestions = []);
+      return;
+    }
+
+    final token = match.group(0)!.toLowerCase();
+    final suggestions = <SqlSuggestion>[];
+
+    final sch = tab.selectedSchema.isNotEmpty ? tab.selectedSchema : _selectedSchema;
+    final tables = _databaseTables[sch] ?? [];
+    for (final t in tables) {
+      if (t.toLowerCase().startsWith(token) || (token.length >= 2 && t.toLowerCase().contains(token))) {
+        suggestions.add(SqlSuggestion(
+          label: t,
+          insertText: _activeConnection?.engine == DbEngine.mysql ? '`$t`' : t,
+          category: 'Tabela',
+          icon: Icons.table_chart_rounded,
+          color: const Color(0xFF38BDF8),
+        ));
+      }
+    }
+
+    final views = _databaseViews[sch] ?? [];
+    for (final v in views) {
+      if (v.toLowerCase().startsWith(token) || (token.length >= 2 && v.toLowerCase().contains(token))) {
+        suggestions.add(SqlSuggestion(
+          label: v,
+          insertText: v,
+          category: 'View',
+          icon: Icons.visibility_rounded,
+          color: const Color(0xFF818CF8),
+        ));
+      }
+    }
+
+    for (final entry in _tableColumnsCache.entries) {
+      for (final col in entry.value) {
+        if (col.name.toLowerCase().startsWith(token) && !suggestions.any((s) => s.label == col.name)) {
+          suggestions.add(SqlSuggestion(
+            label: col.name,
+            insertText: col.name,
+            category: 'Coluna',
+            icon: col.isPrimaryKey ? Icons.key_rounded : Icons.view_column_rounded,
+            color: col.isPrimaryKey ? const Color(0xFFF59E0B) : const Color(0xFF10B981),
+          ));
+        }
+      }
+    }
+
+    const keywords = [
+      'SELECT', 'FROM', 'WHERE', 'INSERT INTO', 'UPDATE', 'DELETE FROM',
+      'JOIN', 'LEFT JOIN', 'INNER JOIN', 'RIGHT JOIN', 'ON',
+      'ORDER BY', 'GROUP BY', 'HAVING', 'LIMIT', 'OFFSET',
+      'DISTINCT', 'AS', 'AND', 'OR', 'NOT', 'IN', 'IS NULL', 'IS NOT NULL',
+      'LIKE', 'BETWEEN', 'COUNT(*)', 'SUM', 'AVG', 'MIN', 'MAX',
+      'CREATE TABLE', 'DROP TABLE', 'ALTER TABLE', 'TRUNCATE'
+    ];
+    for (final kw in keywords) {
+      if (kw.toLowerCase().startsWith(token)) {
+        suggestions.add(SqlSuggestion(
+          label: kw,
+          insertText: kw,
+          category: 'SQL',
+          icon: Icons.code_rounded,
+          color: const Color(0xFFF59E0B),
+        ));
+      }
+    }
+
+    setState(() {
+      tab.currentSuggestions = suggestions.take(8).toList();
+    });
+  }
+
+  void _applySuggestion(QueryTabItem tab, SqlSuggestion suggestion) {
+    final text = tab.sqlController.text;
+    final sel = tab.sqlController.selection;
+    if (sel.baseOffset <= 0) return;
+
+    final beforeCursor = text.substring(0, sel.baseOffset);
+    final afterCursor = text.substring(sel.baseOffset);
+    final match = RegExp(r'[a-zA-Z0-9_]+$').firstMatch(beforeCursor);
+    if (match == null) return;
+
+    final tokenStart = match.start;
+    final newText = '${text.substring(0, tokenStart)}${suggestion.insertText} $afterCursor';
+    final newCursor = tokenStart + suggestion.insertText.length + 1;
+
+    tab.sqlController.value = TextEditingValue(
+      text: newText,
+      selection: TextSelection.collapsed(offset: newCursor),
+    );
+
+    setState(() {
+      tab.currentSuggestions = [];
+    });
   }
 
   Future<void> _executeQuery(QueryTabItem tab) async {
@@ -343,24 +879,45 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
       return;
     }
 
-    final sql = tab.sqlController.text.trim();
-    if (sql.isEmpty) return;
-
-    // Safety check for production environment
-    if (_activeConnection?.environment == DbEnvironment.production) {
-      final upper = sql.toUpperCase();
-      if (upper.contains('DROP ') || upper.contains('TRUNCATE ') || upper.contains('DELETE ') || upper.contains('UPDATE ')) {
-        final confirm = await _showProductionWarningDialog(sql);
-        if (!confirm) return;
-      }
+    final selection = tab.sqlController.selection;
+    String rawSql = '';
+    if (!selection.isCollapsed && selection.start != selection.end) {
+      final start = selection.start < selection.end ? selection.start : selection.end;
+      final end = selection.start < selection.end ? selection.end : selection.start;
+      rawSql = tab.sqlController.text.substring(start, end).trim();
+    } else {
+      rawSql = tab.sqlController.text.trim();
     }
+    if (rawSql.isEmpty) return;
+
+    final statements = _splitSqlStatements(rawSql);
+    if (statements.isEmpty) return;
 
     setState(() => tab.isRunning = true);
-    final res = await _activeClient!.executeQuery(sql, maxRows: 500);
+
+    final resultsList = <DbQueryResult>[];
+    for (final stmt in statements) {
+      // Safety check for production environment
+      if (_activeConnection?.environment == DbEnvironment.production) {
+        final upper = stmt.toUpperCase();
+        if (upper.contains('DROP ') || upper.contains('TRUNCATE ') || upper.contains('DELETE ') || upper.contains('UPDATE ')) {
+          final confirm = await _showProductionWarningDialog(stmt);
+          if (!confirm) {
+            setState(() => tab.isRunning = false);
+            return;
+          }
+        }
+      }
+
+      final res = await _activeClient!.executeQuery(stmt, maxRows: 1000);
+      resultsList.add(res);
+      if (res.hasError) break; // Interrompe no primeiro erro
+    }
 
     if (mounted) {
       setState(() {
-        tab.result = res;
+        tab.results = resultsList;
+        tab.selectedResultIndex = 0;
         tab.isRunning = false;
         tab.pageIndex = 0;
       });
@@ -553,6 +1110,14 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
                     ),
                   ),
                   IconButton(
+                    onPressed: _refreshTree,
+                    icon: const Icon(Icons.refresh_rounded, size: 16),
+                    tooltip: 'Recarregar Árvore',
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                  ),
+                  const SizedBox(width: 8),
+                  IconButton(
                     onPressed: _disconnectActive,
                     icon: const Icon(Icons.power_settings_new_rounded, size: 16, color: Color(0xFFEF4444)),
                     tooltip: 'Desconectar',
@@ -565,7 +1130,7 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
 
           // Main Sidebar Content: Connection list OR Metadata Tree
           Expanded(
-            child: _activeConnection == null || _tables.isEmpty
+            child: _activeConnection == null
                 ? _buildConnectionsListView(isDark)
                 : _buildMetadataTreeView(isDark),
           ),
@@ -696,127 +1261,160 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
   }
 
   Widget _buildMetadataTreeView(bool isDark) {
-    final filteredTables = _tableSearchQuery.isEmpty
-        ? _tables
-        : _tables.where((t) => t.toLowerCase().contains(_tableSearchQuery.toLowerCase())).toList();
-
     return Column(
       children: [
-        // Schemas Selector & Table Search
+        // Table Search & Filter input
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          child: Column(
-            children: [
-              if (_schemas.length > 1)
-                DropdownButtonFormField<String>(
-                  initialValue: _selectedSchema,
-                  isDense: true,
-                  decoration: const InputDecoration(
-                    labelText: 'Esquema (Schema)',
-                    contentPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    border: OutlineInputBorder(),
-                  ),
-                  items: _schemas.map((s) => DropdownMenuItem(value: s, child: Text(s, style: const TextStyle(fontSize: 12)))).toList(),
-                  onChanged: (val) {
-                    if (val != null) {
-                      setState(() => _selectedSchema = val);
-                      _refreshTables();
-                    }
-                  },
-                ),
-              const SizedBox(height: 6),
-              TextField(
-                decoration: InputDecoration(
-                  hintText: 'Buscar tabelas (${filteredTables.length})...',
-                  prefixIcon: const Icon(Icons.search, size: 16),
-                  isDense: true,
-                  contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-                  border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
-                ),
-                style: const TextStyle(fontSize: 12),
-                onChanged: (val) => setState(() => _tableSearchQuery = val),
-              ),
-            ],
+          child: TextField(
+            decoration: InputDecoration(
+              hintText: 'Filtrar tabelas, views...',
+              prefixIcon: const Icon(Icons.search, size: 16),
+              suffixIcon: _treeSearchQuery.isNotEmpty
+                  ? IconButton(
+                      icon: const Icon(Icons.clear, size: 14),
+                      onPressed: () => setState(() => _treeSearchQuery = ''),
+                    )
+                  : null,
+              isDense: true,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            style: const TextStyle(fontSize: 12),
+            onChanged: (val) => setState(() => _treeSearchQuery = val.trim()),
           ),
         ),
         const Divider(height: 1),
 
-        // Tables List
+        // Tree List (DBeaver style)
         Expanded(
           child: ListView.builder(
-            itemCount: filteredTables.length,
-            itemBuilder: (ctx, i) {
-              final table = filteredTables[i];
-              final isExpanded = _expandedTables.contains(table);
-              final cachedCols = _tableColumnsCache[table];
+            itemCount: _schemas.length,
+            itemBuilder: (ctx, idx) {
+              final schema = _schemas[idx];
+              final isDbExpanded = _expandedDatabases.contains(schema) || _treeSearchQuery.isNotEmpty;
+              final isSelected = schema == _selectedSchema;
+              final tables = _databaseTables[schema];
+              final views = _databaseViews[schema];
+              final functions = _databaseFunctions[schema];
 
               return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  ListTile(
-                    dense: true,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 10),
-                    leading: const Icon(Icons.table_chart_rounded, size: 16, color: Color(0xFF38BDF8)),
-                    title: Text(table, style: const TextStyle(fontSize: 12.5, fontWeight: FontWeight.w500)),
-                    trailing: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        IconButton(
-                          icon: Icon(isExpanded ? Icons.keyboard_arrow_down_rounded : Icons.keyboard_arrow_right_rounded, size: 18),
-                          onPressed: () async {
-                            setState(() {
-                              if (isExpanded) {
-                                _expandedTables.remove(table);
-                              } else {
-                                _expandedTables.add(table);
-                              }
-                            });
-                            if (!isExpanded && cachedCols == null && _activeClient != null) {
-                              final cols = await _activeClient!.getTableColumns(table, schema: _selectedSchema);
-                              setState(() => _tableColumnsCache[table] = cols);
-                            }
-                          },
-                        ),
-                      ],
-                    ),
-                    onTap: () => _openTableTab(table),
-                  ),
-                  if (isExpanded)
-                    Container(
-                      padding: const EdgeInsets.only(left: 32, right: 10, bottom: 6),
-                      child: cachedCols == null
-                          ? const SizedBox(height: 20, child: LinearProgressIndicator())
-                          : Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: cachedCols.map((c) {
-                                return Padding(
-                                  padding: const EdgeInsets.symmetric(vertical: 2),
-                                  child: Row(
-                                    children: [
-                                      Icon(
-                                        c.isPrimaryKey ? Icons.key_rounded : Icons.lens_rounded,
-                                        size: c.isPrimaryKey ? 12 : 6,
-                                        color: c.isPrimaryKey ? const Color(0xFFF59E0B) : Colors.grey,
-                                      ),
-                                      const SizedBox(width: 6),
-                                      Expanded(
-                                        child: Text(
-                                          c.name,
-                                          style: TextStyle(
-                                            fontSize: 11,
-                                            fontWeight: c.isPrimaryKey ? FontWeight.bold : FontWeight.normal,
-                                          ),
-                                        ),
-                                      ),
-                                      Text(
-                                        c.dataType,
-                                        style: const TextStyle(fontSize: 10.5, color: Colors.grey, fontFamily: 'monospace'),
-                                      ),
-                                    ],
-                                  ),
-                                );
-                              }).toList(),
+                  // Database Node
+                  InkWell(
+                    onTap: () async {
+                      setState(() {
+                        if (_expandedDatabases.contains(schema)) {
+                          _expandedDatabases.remove(schema);
+                        } else {
+                          _expandedDatabases.add(schema);
+                        }
+                        _selectedSchema = schema;
+                      });
+                      if (!_databaseTables.containsKey(schema)) {
+                        await _loadSchemaContent(schema);
+                      }
+                    },
+                    onSecondaryTapDown: (details) => _showDatabaseContextMenu(context, details.globalPosition, schema),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+                      color: isSelected
+                          ? (_activeConnection?.engine.brandColor ?? Colors.blue).withValues(alpha: 0.08)
+                          : Colors.transparent,
+                      child: Row(
+                        children: [
+                          Icon(
+                            isDbExpanded ? Icons.arrow_drop_down_rounded : Icons.arrow_right_rounded,
+                            size: 20,
+                            color: Colors.grey,
+                          ),
+                          Icon(
+                            Icons.storage_rounded,
+                            size: 16,
+                            color: _activeConnection?.engine.brandColor ?? const Color(0xFF38BDF8),
+                          ),
+                          const SizedBox(width: 6),
+                          Expanded(
+                            child: Text(
+                              schema,
+                              style: TextStyle(
+                                fontSize: 12.5,
+                                fontWeight: FontWeight.bold,
+                                color: isSelected ? (_activeConnection?.engine.brandColor ?? Colors.blue) : null,
+                              ),
+                              overflow: TextOverflow.ellipsis,
                             ),
+                          ),
+                          if (isSelected)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                              margin: const EdgeInsets.only(right: 4),
+                              decoration: BoxDecoration(
+                                color: const Color(0xFF10B981).withValues(alpha: 0.15),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: const Text('ativo', style: TextStyle(fontSize: 9.5, color: Color(0xFF10B981), fontWeight: FontWeight.bold)),
+                            ),
+                          Builder(
+                            builder: (ctx) => IconButton(
+                              icon: const Icon(Icons.more_vert_rounded, size: 15, color: Colors.grey),
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(),
+                              tooltip: 'Opções do banco',
+                              onPressed: () {
+                                final box = ctx.findRenderObject() as RenderBox?;
+                                final offset = box != null ? box.localToGlobal(Offset(0, box.size.height)) : Offset.zero;
+                                _showDatabaseContextMenu(context, offset, schema);
+                              },
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
+                  ),
+
+                  // If database is expanded: Folders (Tabelas, Views, Functions)
+                  if (isDbExpanded) ...[
+                    // Folder 1: Tabelas
+                    _buildTreeFolder(
+                      schema: schema,
+                      folderKey: '$schema:tables',
+                      title: 'Tabelas',
+                      icon: Icons.table_chart_rounded,
+                      iconColor: const Color(0xFF38BDF8),
+                      items: tables,
+                      itemIcon: Icons.table_rows_rounded,
+                      itemColor: const Color(0xFF38BDF8),
+                      isView: false,
+                      isDark: isDark,
+                    ),
+
+                    // Folder 2: Views
+                    _buildTreeFolder(
+                      schema: schema,
+                      folderKey: '$schema:views',
+                      title: 'Views',
+                      icon: Icons.visibility_rounded,
+                      iconColor: const Color(0xFF818CF8),
+                      items: views,
+                      itemIcon: Icons.visibility_outlined,
+                      itemColor: const Color(0xFF818CF8),
+                      isView: true,
+                      isDark: isDark,
+                    ),
+
+                    // Folder 3: Funções & Procedures
+                    _buildTreeFunctionFolder(
+                      schema: schema,
+                      folderKey: '$schema:functions',
+                      title: 'Funções & Procedures',
+                      icon: Icons.functions_rounded,
+                      iconColor: const Color(0xFF10B981),
+                      functions: functions,
+                      isDark: isDark,
+                    ),
+                  ],
                 ],
               );
             },
@@ -826,9 +1424,344 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
     );
   }
 
+  Widget _buildTreeFolder({
+    required String schema,
+    required String folderKey,
+    required String title,
+    required IconData icon,
+    required Color iconColor,
+    required List<String>? items,
+    required IconData itemIcon,
+    required Color itemColor,
+    required bool isView,
+    required bool isDark,
+  }) {
+    final isFolderExpanded = _expandedFolders.contains(folderKey) || _treeSearchQuery.isNotEmpty;
+    final filtered = items == null
+        ? null
+        : (_treeSearchQuery.isEmpty
+            ? items
+            : items.where((i) => i.toLowerCase().contains(_treeSearchQuery.toLowerCase())).toList());
+
+    if (_treeSearchQuery.isNotEmpty && (filtered == null || filtered.isEmpty)) {
+      return const SizedBox.shrink();
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        // Folder Header
+        InkWell(
+          onTap: () {
+            setState(() {
+              if (_expandedFolders.contains(folderKey)) {
+                _expandedFolders.remove(folderKey);
+              } else {
+                _expandedFolders.add(folderKey);
+              }
+            });
+          },
+          child: Padding(
+            padding: const EdgeInsets.only(left: 20, top: 4, bottom: 4, right: 8),
+            child: Row(
+              children: [
+                Icon(
+                  isFolderExpanded ? Icons.keyboard_arrow_down_rounded : Icons.keyboard_arrow_right_rounded,
+                  size: 16,
+                  color: Colors.grey,
+                ),
+                const SizedBox(width: 2),
+                const Icon(Icons.folder_rounded, size: 16, color: Color(0xFFF59E0B)),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    '$title ${items != null ? "(${items.length})" : ""}',
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+
+        // Items inside folder
+        if (isFolderExpanded) ...[
+          if (items == null)
+            const Padding(
+              padding: EdgeInsets.only(left: 48, top: 4, bottom: 4),
+              child: SizedBox(height: 12, width: 120, child: LinearProgressIndicator()),
+            )
+          else if (filtered!.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 48, top: 4, bottom: 4),
+              child: Text(
+                'Nenhum item.',
+                style: TextStyle(fontSize: 11, color: isDark ? Colors.white38 : Colors.black38, fontStyle: FontStyle.italic),
+              ),
+            )
+          else
+            ...filtered.map((item) {
+              final tableKey = '$schema:$item';
+              final isTableExpanded = _expandedTables.contains(tableKey);
+              final cachedCols = _tableColumnsCache[tableKey];
+
+              return Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  GestureDetector(
+                    onSecondaryTapDown: (details) {
+                      _showTableContextMenu(context, details.globalPosition, schema, item, isView: isView);
+                    },
+                    child: InkWell(
+                      onTap: () {
+                        if (isView) {
+                          _selectTop1000(schema, item);
+                        } else {
+                          _openTableTab(item, schema: schema);
+                        }
+                      },
+                      child: Padding(
+                        padding: const EdgeInsets.only(left: 36, top: 2, bottom: 2, right: 6),
+                        child: Row(
+                          children: [
+                            if (!isView)
+                              InkWell(
+                                onTap: () async {
+                                  setState(() {
+                                    if (isTableExpanded) {
+                                      _expandedTables.remove(tableKey);
+                                    } else {
+                                      _expandedTables.add(tableKey);
+                                    }
+                                  });
+                                  if (!isTableExpanded && cachedCols == null && _activeClient != null) {
+                                    final cols = await _activeClient!.getTableColumns(item, schema: schema);
+                                    if (mounted) setState(() => _tableColumnsCache[tableKey] = cols);
+                                  }
+                                },
+                                child: Icon(
+                                  isTableExpanded ? Icons.keyboard_arrow_down_rounded : Icons.keyboard_arrow_right_rounded,
+                                  size: 16,
+                                  color: Colors.grey,
+                                ),
+                              )
+                            else
+                              const SizedBox(width: 16),
+                            const SizedBox(width: 2),
+                            Icon(itemIcon, size: 15, color: itemColor),
+                            const SizedBox(width: 6),
+                            Expanded(
+                              child: Text(
+                                item,
+                                style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            IconButton(
+                              icon: const Icon(Icons.more_vert_rounded, size: 14, color: Colors.grey),
+                              padding: EdgeInsets.zero,
+                              constraints: const BoxConstraints(),
+                              tooltip: 'Opções da Tabela',
+                              onPressed: () {
+                                final renderBox = context.findRenderObject() as RenderBox?;
+                                final offset = renderBox?.localToGlobal(Offset.zero) ?? const Offset(200, 200);
+                                _showTableContextMenu(context, offset, schema, item, isView: isView);
+                              },
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+
+                  // Column list inside table
+                  if (isTableExpanded)
+                    Padding(
+                      padding: const EdgeInsets.only(left: 58, right: 8, bottom: 4),
+                      child: cachedCols == null
+                          ? const SizedBox(height: 12, width: 100, child: LinearProgressIndicator())
+                          : Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: cachedCols.map((col) {
+                                return Padding(
+                                  padding: const EdgeInsets.symmetric(vertical: 1.5),
+                                  child: Row(
+                                    children: [
+                                      Icon(
+                                        col.isPrimaryKey ? Icons.key_rounded : Icons.lens_rounded,
+                                        size: col.isPrimaryKey ? 12 : 5,
+                                        color: col.isPrimaryKey ? const Color(0xFFF59E0B) : Colors.grey,
+                                      ),
+                                      const SizedBox(width: 6),
+                                      Expanded(
+                                        child: Text(
+                                          col.name,
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: col.isPrimaryKey ? FontWeight.bold : FontWeight.normal,
+                                          ),
+                                          overflow: TextOverflow.ellipsis,
+                                        ),
+                                      ),
+                                      Text(
+                                        col.dataType,
+                                        style: const TextStyle(fontSize: 10, color: Colors.grey, fontFamily: 'monospace'),
+                                      ),
+                                    ],
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                    ),
+                ],
+              );
+            }),
+        ],
+      ],
+    );
+  }
+
+  Widget _buildTreeFunctionFolder({
+    required String schema,
+    required String folderKey,
+    required String title,
+    required IconData icon,
+    required Color iconColor,
+    required List<String>? functions,
+    required bool isDark,
+  }) {
+    final isFolderExpanded = _expandedFolders.contains(folderKey) || _treeSearchQuery.isNotEmpty;
+    final filtered = functions == null
+        ? null
+        : (_treeSearchQuery.isEmpty
+            ? functions
+            : functions.where((f) => f.toLowerCase().contains(_treeSearchQuery.toLowerCase())).toList());
+
+    if (_treeSearchQuery.isNotEmpty && (filtered == null || filtered.isEmpty)) {
+      return const SizedBox.shrink();
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        InkWell(
+          onTap: () {
+            setState(() {
+              if (_expandedFolders.contains(folderKey)) {
+                _expandedFolders.remove(folderKey);
+              } else {
+                _expandedFolders.add(folderKey);
+              }
+            });
+          },
+          child: Padding(
+            padding: const EdgeInsets.only(left: 20, top: 4, bottom: 4, right: 8),
+            child: Row(
+              children: [
+                Icon(
+                  isFolderExpanded ? Icons.keyboard_arrow_down_rounded : Icons.keyboard_arrow_right_rounded,
+                  size: 16,
+                  color: Colors.grey,
+                ),
+                const SizedBox(width: 2),
+                const Icon(Icons.folder_rounded, size: 16, color: Color(0xFFF59E0B)),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    '$title ${functions != null ? "(${functions.length})" : ""}',
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+        if (isFolderExpanded) ...[
+          if (functions == null)
+            const Padding(
+              padding: EdgeInsets.only(left: 48, top: 4, bottom: 4),
+              child: SizedBox(height: 12, width: 120, child: LinearProgressIndicator()),
+            )
+          else if (filtered!.isEmpty)
+            Padding(
+              padding: const EdgeInsets.only(left: 48, top: 4, bottom: 4),
+              child: Text(
+                'Nenhuma função.',
+                style: TextStyle(fontSize: 11, color: isDark ? Colors.white38 : Colors.black38, fontStyle: FontStyle.italic),
+              ),
+            )
+          else
+            ...filtered.map((fn) {
+              return InkWell(
+                onTap: () {
+                  _addNewQueryTab(initialSql: '-- Chamada para $fn\nSELECT ${_formatTableName(schema, fn)}();\n');
+                },
+                child: Padding(
+                  padding: const EdgeInsets.only(left: 36, top: 2, bottom: 2, right: 6),
+                  child: Row(
+                    children: [
+                      const SizedBox(width: 16),
+                      Icon(icon, size: 14, color: iconColor),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text(
+                          fn,
+                          style: const TextStyle(fontSize: 11.5, fontFamily: 'monospace'),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              );
+            }),
+        ],
+      ],
+    );
+  }
+
   Widget _buildWorkspace(Color cardBg, Color borderCol, bool isDark) {
     if (_tabs.isEmpty) {
-      return const Center(child: Text('Nenhuma aba aberta.'));
+      return Center(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.terminal_rounded, size: 56, color: isDark ? Colors.white24 : Colors.black26),
+            const SizedBox(height: 12),
+            const Text('Nenhum editor aberto', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+            const SizedBox(height: 6),
+            Text(
+              'Abra uma nova consulta SQL ou selecione uma tabela no painel lateral.',
+              style: TextStyle(fontSize: 13, color: isDark ? Colors.white54 : Colors.black54),
+            ),
+            const SizedBox(height: 20),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                ElevatedButton.icon(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF10B981),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  ),
+                  onPressed: () => _addNewQueryTab(),
+                  icon: const Icon(Icons.post_add_rounded, size: 18),
+                  label: const Text('Nova Consulta SQL'),
+                ),
+                const SizedBox(width: 12),
+                OutlinedButton.icon(
+                  style: OutlinedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  ),
+                  onPressed: () => _openQueryFromFile(),
+                  icon: const Icon(Icons.folder_open_rounded, size: 18),
+                  label: const Text('Abrir Arquivo .sql'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      );
     }
 
     return Column(
@@ -849,6 +1782,9 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
                     final isSel = _activeTabIndex == i;
                     return GestureDetector(
                       onTap: () => setState(() => _activeTabIndex = i),
+                      onSecondaryTapDown: tab is QueryTabItem
+                          ? (details) => _showQueryTabContextMenu(context, details.globalPosition, tab, i)
+                          : null,
                       child: Container(
                         padding: const EdgeInsets.symmetric(horizontal: 14),
                         decoration: BoxDecoration(
@@ -886,6 +1822,11 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
                 ),
               ),
               IconButton(
+                onPressed: () => _openQueryFromFile(),
+                icon: const Icon(Icons.folder_open_rounded, size: 18),
+                tooltip: 'Abrir Arquivo .sql do Disco',
+              ),
+              IconButton(
                 onPressed: () => _addNewQueryTab(),
                 icon: const Icon(Icons.add_rounded, size: 18),
                 tooltip: 'Nova Aba SQL',
@@ -914,6 +1855,7 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
   }
 
   Widget _buildQueryTabContent(QueryTabItem tab, bool isDark, Color borderCol) {
+    final activeResult = tab.currentResult;
     return Column(
       children: [
         // SQL Editor Panel
@@ -923,6 +1865,7 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
             color: isDark ? const Color(0xFF0F172A) : Colors.white,
             padding: const EdgeInsets.all(12),
             child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 // Toolbar
                 Row(
@@ -939,17 +1882,62 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
                           : const Icon(Icons.play_arrow_rounded, size: 18),
                       label: const Text('Executar (Ctrl+Enter)'),
                     ),
-                    const SizedBox(width: 12),
-                    if (tab.result != null) ...[
+                    const SizedBox(width: 10),
+                    // Database Schema Selector
+                    if (_schemas.isNotEmpty) ...[
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        height: 32,
+                        decoration: BoxDecoration(
+                          border: Border.all(color: isDark ? Colors.white24 : Colors.black26),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: DropdownButtonHideUnderline(
+                          child: DropdownButton<String>(
+                            value: _schemas.contains(tab.selectedSchema)
+                                ? tab.selectedSchema
+                                : (_schemas.isNotEmpty ? _schemas.first : null),
+                            isDense: true,
+                            style: TextStyle(fontSize: 12, color: isDark ? Colors.white : Colors.black87),
+                            hint: const Text('Banco de Dados', style: TextStyle(fontSize: 12)),
+                            items: _schemas.map((s) => DropdownMenuItem(value: s, child: Text(s))).toList(),
+                            onChanged: (val) {
+                              if (val != null) setState(() => tab.selectedSchema = val);
+                            },
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                    ],
+                    // Save and Save As
+                    IconButton(
+                      icon: Icon(Icons.save_rounded, size: 18, color: tab.isDirty ? const Color(0xFFF59E0B) : null),
+                      tooltip: tab.filePath != null ? 'Salvar (${tab.filePath}) [Ctrl+S]' : 'Salvar Consulta (.sql) [Ctrl+S]',
+                      onPressed: () => _saveQueryTab(tab),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.save_as_rounded, size: 18),
+                      tooltip: 'Salvar Como...',
+                      onPressed: () => _saveQueryTabAs(tab),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.folder_open_rounded, size: 18),
+                      tooltip: 'Abrir Arquivo .sql',
+                      onPressed: () => _openQueryFromFile(),
+                    ),
+                    const SizedBox(width: 8),
+                    if (activeResult != null) ...[
                       Chip(
-                        label: Text('⏱️ ${tab.result!.executionTimeMs} ms', style: const TextStyle(fontSize: 11)),
+                        label: Text('⏱️ ${activeResult.executionTimeMs} ms', style: const TextStyle(fontSize: 11)),
                         padding: EdgeInsets.zero,
                         visualDensity: VisualDensity.compact,
                       ),
                       const SizedBox(width: 8),
                       Chip(
-                        label: Text('📊 ${tab.result!.isSelect ? "${tab.result!.rows.length} linhas" : "${tab.result!.affectedRows} afetadas"}',
-                            style: const TextStyle(fontSize: 11)),
+                        label: Text(
+                          '📊 ${activeResult.isSelect ? "${activeResult.rows.length} linhas" : "${activeResult.affectedRows} afetadas"}',
+                          style: const TextStyle(fontSize: 11),
+                        ),
                         padding: EdgeInsets.zero,
                         visualDensity: VisualDensity.compact,
                       ),
@@ -962,46 +1950,160 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
                     ),
                   ],
                 ),
-                const SizedBox(height: 8),
-                // Text Area with Shortcuts
+                const SizedBox(height: 6),
+                // Text Area with Shortcuts and Intellisense listener
                 Expanded(
                   child: Shortcuts(
                     shortcuts: {
                       LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.enter): const ActivateIntent(),
+                      LogicalKeySet(LogicalKeyboardKey.control, LogicalKeyboardKey.keyS): const _SaveSqlIntent(),
                     },
                     child: Actions(
                       actions: {
                         ActivateIntent: CallbackAction<ActivateIntent>(onInvoke: (_) => _executeQuery(tab)),
+                        _SaveSqlIntent: CallbackAction<_SaveSqlIntent>(onInvoke: (_) => _saveQueryTab(tab)),
                       },
                       child: TextField(
                         controller: tab.sqlController,
                         maxLines: null,
                         expands: true,
+                        onChanged: (_) => _onSqlTextChanged(tab),
                         style: const TextStyle(
                           fontFamily: 'monospace',
                           fontSize: 13,
                           height: 1.4,
                         ),
-                        decoration: const InputDecoration(
+                        decoration: InputDecoration(
                           border: InputBorder.none,
-                          hintText: 'Escreva sua consulta SQL aqui...',
+                          hintText: 'Escreva sua consulta SQL aqui...\nDica: Selecione uma linha ou consulta específica para rodar somente ela.',
+                          hintStyle: TextStyle(
+                            fontSize: 12.5,
+                            color: isDark ? Colors.white24 : Colors.black26,
+                            fontFamily: 'sans-serif',
+                          ),
                         ),
                       ),
                     ),
                   ),
                 ),
+                // Intellisense Suggestion Chips
+                if (tab.currentSuggestions.isNotEmpty)
+                  Container(
+                    margin: const EdgeInsets.only(top: 4),
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: isDark ? const Color(0xFF1E293B) : const Color(0xFFF8FAFC),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: const Color(0xFF10B981).withValues(alpha: 0.5)),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.auto_awesome_rounded, size: 14, color: Color(0xFF10B981)),
+                        const SizedBox(width: 6),
+                        const Text('Sugestões: ', style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold)),
+                        const SizedBox(width: 4),
+                        Expanded(
+                          child: SingleChildScrollView(
+                            scrollDirection: Axis.horizontal,
+                            child: Row(
+                              children: tab.currentSuggestions.map((s) {
+                                return Padding(
+                                  padding: const EdgeInsets.only(right: 6),
+                                  child: ActionChip(
+                                    avatar: Icon(s.icon, size: 13, color: s.color),
+                                    label: Text('${s.label} (${s.category})', style: const TextStyle(fontSize: 11)),
+                                    visualDensity: VisualDensity.compact,
+                                    padding: const EdgeInsets.symmetric(horizontal: 4),
+                                    onPressed: () => _applySuggestion(tab, s),
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                          ),
+                        ),
+                        IconButton(
+                          icon: const Icon(Icons.close_rounded, size: 14),
+                          padding: EdgeInsets.zero,
+                          constraints: const BoxConstraints(),
+                          tooltip: 'Fechar sugestões',
+                          onPressed: () => setState(() => tab.currentSuggestions = []),
+                        ),
+                      ],
+                    ),
+                  ),
               ],
             ),
           ),
         ),
         Divider(height: 1, thickness: 1, color: borderCol),
 
+        // Multi-result Switcher Bar (if more than 1 query result)
+        if (tab.results.length > 1)
+          Container(
+            height: 34,
+            color: isDark ? const Color(0xFF162032) : const Color(0xFFE2E8F0),
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              itemCount: tab.results.length,
+              itemBuilder: (ctx, rIdx) {
+                final isResSelected = tab.selectedResultIndex == rIdx;
+                final resItem = tab.results[rIdx];
+                final label = 'Resultado ${rIdx + 1}: ${resItem.isSelect ? "${resItem.rows.length} lin" : "${resItem.affectedRows} afet"}';
+                return InkWell(
+                  onTap: () => setState(() {
+                    tab.selectedResultIndex = rIdx;
+                    tab.pageIndex = 0;
+                  }),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    alignment: Alignment.center,
+                    decoration: BoxDecoration(
+                      color: isResSelected ? (isDark ? const Color(0xFF0F172A) : Colors.white) : Colors.transparent,
+                      border: Border(
+                        bottom: BorderSide(
+                          color: isResSelected ? const Color(0xFF10B981) : Colors.transparent,
+                          width: 2,
+                        ),
+                        right: BorderSide(color: borderCol, width: 1),
+                      ),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          resItem.hasError ? Icons.error_outline : Icons.check_circle_outline,
+                          size: 14,
+                          color: resItem.hasError ? const Color(0xFFEF4444) : const Color(0xFF10B981),
+                        ),
+                        const SizedBox(width: 6),
+                        Text(
+                          label,
+                          style: TextStyle(
+                            fontSize: 11.5,
+                            fontWeight: isResSelected ? FontWeight.bold : FontWeight.normal,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+
         // Results Panel
         Expanded(
           flex: 6,
-          child: _buildResultsGrid(tab.result, tab.pageIndex, tab.pageSize, (idx) {
-            setState(() => tab.pageIndex = idx);
-          }, isDark),
+          child: _buildResultsGrid(
+            tab.currentResult,
+            tab.pageIndex,
+            tab.pageSize,
+            (idx) => setState(() => tab.pageIndex = idx),
+            (size) => setState(() => tab.pageSize = size),
+            tab.verticalScroll,
+            tab.horizontalScroll,
+            isDark,
+          ),
         ),
       ],
     );
@@ -1010,17 +2112,22 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
   Widget _buildTableTabContent(TableTabItem tab, bool isDark, Color borderCol) {
     return Column(
       children: [
-        // Sub-tabs switcher (DBeaver style: Dados | Estrutura | DDL)
+        // Sub-tabs switcher (DBeaver style: Dados | Estrutura | Chaves Estrangeiras | DDL)
         Container(
           color: isDark ? const Color(0xFF162032) : Colors.white,
           padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
           child: Row(
             children: [
               SegmentedButton<int>(
-                segments: const [
-                  ButtonSegment(value: 0, label: Text('📊 Dados'), icon: Icon(Icons.table_rows_rounded, size: 16)),
-                  ButtonSegment(value: 1, label: Text('⚙️ Estrutura'), icon: Icon(Icons.schema_rounded, size: 16)),
-                  ButtonSegment(value: 2, label: Text('📜 DDL / SQL'), icon: Icon(Icons.code_rounded, size: 16)),
+                segments: [
+                  const ButtonSegment(value: 0, label: Text('📊 Dados'), icon: Icon(Icons.table_rows_rounded, size: 16)),
+                  const ButtonSegment(value: 1, label: Text('⚙️ Estrutura'), icon: Icon(Icons.schema_rounded, size: 16)),
+                  ButtonSegment(
+                    value: 2,
+                    label: Text('🔗 Chaves Estrangeiras (${tab.foreignKeys.length + tab.referencingKeys.length})'),
+                    icon: const Icon(Icons.link_rounded, size: 16),
+                  ),
+                  const ButtonSegment(value: 3, label: Text('📜 DDL / SQL'), icon: Icon(Icons.code_rounded, size: 16)),
                 ],
                 selected: {tab.subTabIndex},
                 onSelectionChanged: (set) => setState(() => tab.subTabIndex = set.first),
@@ -1043,15 +2150,29 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
               : IndexedStack(
                   index: tab.subTabIndex,
                   children: [
-                    // Sub-tab 0: Dados
-                    _buildResultsGrid(tab.dataResult, tab.pageIndex, tab.pageSize, (idx) {
-                      setState(() => tab.pageIndex = idx);
-                    }, isDark),
+                    // Sub-tab 0: Dados (with Foreign Key Navigation)
+                    _buildResultsGrid(
+                      tab.dataResult,
+                      tab.pageIndex,
+                      tab.pageSize,
+                      (idx) => setState(() => tab.pageIndex = idx),
+                      (size) => setState(() => tab.pageSize = size),
+                      tab.verticalScroll,
+                      tab.horizontalScroll,
+                      isDark,
+                      foreignKeys: tab.foreignKeys,
+                      referencingKeys: tab.referencingKeys,
+                      currentSchema: tab.schema,
+                      currentTable: tab.tableName,
+                    ),
 
-                    // Sub-tab 1: Estrutura (Colunas, tipos, PK)
-                    _buildStructureGrid(tab.columns, isDark),
+                    // Sub-tab 1: Estrutura (Colunas, tipos, PK, FK)
+                    _buildStructureGrid(tab.columns, isDark, foreignKeys: tab.foreignKeys),
 
-                    // Sub-tab 2: DDL
+                    // Sub-tab 2: Chaves Estrangeiras (Outbound & Inbound)
+                    _buildForeignKeysView(tab, isDark),
+
+                    // Sub-tab 3: DDL
                     _buildDdlView(tab.ddl, isDark),
                   ],
                 ),
@@ -1060,43 +2181,237 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
     );
   }
 
-  Widget _buildStructureGrid(List<TableColumnMetadata>? columns, bool isDark) {
+  Widget _buildStructureGrid(List<TableColumnMetadata>? columns, bool isDark, {List<TableForeignKey>? foreignKeys}) {
     if (columns == null || columns.isEmpty) {
       return const Center(child: Text('Nenhuma coluna disponível.'));
     }
 
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(12),
-      child: DataTable(
-        columns: const [
-          DataColumn(label: Text('Nome da Coluna', style: TextStyle(fontWeight: FontWeight.bold))),
-          DataColumn(label: Text('Tipo de Dado', style: TextStyle(fontWeight: FontWeight.bold))),
-          DataColumn(label: Text('Nullable', style: TextStyle(fontWeight: FontWeight.bold))),
-          DataColumn(label: Text('Chave Primária', style: TextStyle(fontWeight: FontWeight.bold))),
-          DataColumn(label: Text('Valor Padrão', style: TextStyle(fontWeight: FontWeight.bold))),
-        ],
-        rows: columns.map((c) {
-          return DataRow(
-            cells: [
-              DataCell(
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    if (c.isPrimaryKey) ...[
-                      const Icon(Icons.key_rounded, size: 14, color: Color(0xFFF59E0B)),
-                      const SizedBox(width: 6),
-                    ],
-                    Text(c.name, style: TextStyle(fontWeight: c.isPrimaryKey ? FontWeight.bold : FontWeight.normal)),
-                  ],
-                ),
-              ),
-              DataCell(Text(c.dataType, style: const TextStyle(fontFamily: 'monospace'))),
-              DataCell(Text(c.isNullable ? 'SIM' : 'NÃO', style: TextStyle(color: c.isNullable ? Colors.grey : const Color(0xFFEF4444)))),
-              DataCell(Text(c.isPrimaryKey ? '🔑 PK' : '-')),
-              DataCell(Text(c.defaultValue ?? '-')),
+    TableForeignKey? getFk(String colName) {
+      if (foreignKeys == null) return null;
+      try {
+        return foreignKeys.firstWhere((f) => f.fromColumn.toLowerCase() == colName.toLowerCase());
+      } catch (_) {
+        return null;
+      }
+    }
+
+    return Scrollbar(
+      thumbVisibility: true,
+      child: SingleChildScrollView(
+        scrollDirection: Axis.vertical,
+        padding: const EdgeInsets.all(12),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: DataTable(
+            columns: const [
+              DataColumn(label: Text('Nome da Coluna', style: TextStyle(fontWeight: FontWeight.bold))),
+              DataColumn(label: Text('Tipo de Dado', style: TextStyle(fontWeight: FontWeight.bold))),
+              DataColumn(label: Text('Nullable', style: TextStyle(fontWeight: FontWeight.bold))),
+              DataColumn(label: Text('Chave / Relação', style: TextStyle(fontWeight: FontWeight.bold))),
+              DataColumn(label: Text('Valor Padrão', style: TextStyle(fontWeight: FontWeight.bold))),
             ],
-          );
-        }).toList(),
+            rows: columns.map((c) {
+              final fk = getFk(c.name);
+              return DataRow(
+                cells: [
+                  DataCell(
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        if (c.isPrimaryKey) ...[
+                          const Icon(Icons.key_rounded, size: 14, color: Color(0xFFF59E0B)),
+                          const SizedBox(width: 6),
+                        ] else if (fk != null) ...[
+                          const Icon(Icons.link_rounded, size: 14, color: Color(0xFF38BDF8)),
+                          const SizedBox(width: 6),
+                        ],
+                        Text(c.name, style: TextStyle(fontWeight: c.isPrimaryKey ? FontWeight.bold : FontWeight.normal)),
+                      ],
+                    ),
+                  ),
+                  DataCell(Text(c.dataType, style: const TextStyle(fontFamily: 'monospace'))),
+                  DataCell(Text(c.isNullable ? 'SIM' : 'NÃO', style: TextStyle(color: c.isNullable ? Colors.grey : const Color(0xFFEF4444)))),
+                  DataCell(
+                    c.isPrimaryKey
+                        ? const Text('🔑 Chave Primária (PK)', style: TextStyle(color: Color(0xFFF59E0B), fontWeight: FontWeight.bold))
+                        : (fk != null
+                            ? InkWell(
+                                onTap: () => _openTableTab(fk.toTable, schema: fk.toSchema),
+                                child: Text('🔗 FK -> ${fk.toTable}.${fk.toColumn}',
+                                    style: const TextStyle(color: Color(0xFF38BDF8), decoration: TextDecoration.underline)),
+                              )
+                            : const Text('-')),
+                  ),
+                  DataCell(Text(c.defaultValue ?? '-')),
+                ],
+              );
+            }).toList(),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildForeignKeysView(TableTabItem tab, bool isDark) {
+    final fks = tab.foreignKeys;
+    final refs = tab.referencingKeys;
+
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Section 1: Outbound Foreign Keys
+          Card(
+            color: isDark ? const Color(0xFF162032) : Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: isDark ? const Color(0xFF26354D) : const Color(0xFFE2E8F0)),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.link_rounded, color: Color(0xFF38BDF8), size: 20),
+                      SizedBox(width: 8),
+                      Text('Chaves Estrangeiras Desta Tabela (Outbound)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text('Colunas desta tabela que apontam para chaves primárias em outras tabelas.',
+                      style: TextStyle(fontSize: 12, color: isDark ? Colors.white54 : Colors.black54)),
+                  const SizedBox(height: 12),
+                  if (fks.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 8),
+                      child: Text('Nenhuma chave estrangeira configurada nesta tabela.',
+                          style: TextStyle(fontStyle: FontStyle.italic, fontSize: 12, color: Colors.grey)),
+                    )
+                  else
+                    DataTable(
+                      columns: const [
+                        DataColumn(label: Text('Constraint', style: TextStyle(fontWeight: FontWeight.bold))),
+                        DataColumn(label: Text('Coluna Origem', style: TextStyle(fontWeight: FontWeight.bold))),
+                        DataColumn(label: Text('Tabela Destino', style: TextStyle(fontWeight: FontWeight.bold))),
+                        DataColumn(label: Text('Coluna Destino', style: TextStyle(fontWeight: FontWeight.bold))),
+                        DataColumn(label: Text('Ação', style: TextStyle(fontWeight: FontWeight.bold))),
+                      ],
+                      rows: fks.map((fk) {
+                        return DataRow(
+                          cells: [
+                            DataCell(Text(fk.constraintName, style: const TextStyle(fontSize: 11.5, fontFamily: 'monospace'))),
+                            DataCell(Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.key_rounded, size: 13, color: Color(0xFF38BDF8)),
+                                const SizedBox(width: 4),
+                                Text(fk.fromColumn, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                              ],
+                            )),
+                            DataCell(Text(fk.toTable, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold))),
+                            DataCell(Text(fk.toColumn, style: const TextStyle(fontSize: 11.5, fontFamily: 'monospace'))),
+                            DataCell(
+                              ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF38BDF8),
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                                onPressed: () {
+                                  _openTableTab(fk.toTable, schema: fk.toSchema.isEmpty ? tab.schema : fk.toSchema);
+                                },
+                                icon: const Icon(Icons.open_in_new_rounded, size: 14),
+                                label: const Text('Abrir Tabela', style: TextStyle(fontSize: 11)),
+                              ),
+                            ),
+                          ],
+                        );
+                      }).toList(),
+                    ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+
+          // Section 2: Inbound / Referencing Keys
+          Card(
+            color: isDark ? const Color(0xFF162032) : Colors.white,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+              side: BorderSide(color: isDark ? const Color(0xFF26354D) : const Color(0xFFE2E8F0)),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Row(
+                    children: [
+                      Icon(Icons.hub_rounded, color: Color(0xFF10B981), size: 20),
+                      SizedBox(width: 8),
+                      Text('Tabelas que Referenciam Esta Tabela (Dependentes)', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14)),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Text('Outras tabelas que possuem chaves estrangeiras apontando para esta tabela.',
+                      style: TextStyle(fontSize: 12, color: isDark ? Colors.white54 : Colors.black54)),
+                  const SizedBox(height: 12),
+                  if (refs.isEmpty)
+                    const Padding(
+                      padding: EdgeInsets.symmetric(vertical: 8),
+                      child: Text('Nenhuma tabela dependente encontrada.',
+                          style: TextStyle(fontStyle: FontStyle.italic, fontSize: 12, color: Colors.grey)),
+                    )
+                  else
+                    DataTable(
+                      columns: const [
+                        DataColumn(label: Text('Tabela Dependente', style: TextStyle(fontWeight: FontWeight.bold))),
+                        DataColumn(label: Text('Coluna FK', style: TextStyle(fontWeight: FontWeight.bold))),
+                        DataColumn(label: Text('Aponta para Coluna', style: TextStyle(fontWeight: FontWeight.bold))),
+                        DataColumn(label: Text('Ação', style: TextStyle(fontWeight: FontWeight.bold))),
+                      ],
+                      rows: refs.map((ref) {
+                        return DataRow(
+                          cells: [
+                            DataCell(Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(Icons.table_chart_rounded, size: 14, color: Color(0xFF10B981)),
+                                const SizedBox(width: 6),
+                                Text(ref.fromTable, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                              ],
+                            )),
+                            DataCell(Text(ref.fromColumn, style: const TextStyle(fontSize: 11.5, fontFamily: 'monospace'))),
+                            DataCell(Text(ref.toColumn, style: const TextStyle(fontSize: 11.5, fontFamily: 'monospace'))),
+                            DataCell(
+                              ElevatedButton.icon(
+                                style: ElevatedButton.styleFrom(
+                                  backgroundColor: const Color(0xFF10B981),
+                                  foregroundColor: Colors.white,
+                                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                  visualDensity: VisualDensity.compact,
+                                ),
+                                onPressed: () {
+                                  _openTableTab(ref.fromTable, schema: ref.fromSchema.isEmpty ? tab.schema : ref.fromSchema);
+                                },
+                                icon: const Icon(Icons.open_in_new_rounded, size: 14),
+                                label: const Text('Abrir Tabela', style: TextStyle(fontSize: 11)),
+                              ),
+                            ),
+                          ],
+                        );
+                      }).toList(),
+                    ),
+                ],
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1146,13 +2461,93 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
     );
   }
 
+  void _showCellNavigationContextMenu(
+    BuildContext context,
+    Offset position, {
+    required String text,
+    required String column,
+    TableForeignKey? fk,
+    List<TableForeignKey>? referencingKeys,
+    required String currentSchema,
+  }) {
+    final textStyle = TextStyle(fontSize: 12, color: widget.isDark ? Colors.white : Colors.black87);
+    final items = <PopupMenuEntry<String>>[];
+
+    if (fk != null && text.isNotEmpty && text != 'NULL') {
+      items.add(PopupMenuItem(
+        value: 'navigate_fk',
+        child: Row(
+          children: [
+            const Icon(Icons.open_in_new_rounded, size: 15, color: Color(0xFF38BDF8)),
+            const SizedBox(width: 8),
+            Text('Ir para ${fk.toTable} (${fk.toColumn} = $text)', style: textStyle),
+          ],
+        ),
+      ));
+    }
+
+    if (referencingKeys != null && referencingKeys.isNotEmpty && text.isNotEmpty && text != 'NULL') {
+      if (items.isNotEmpty) items.add(const PopupMenuDivider());
+      for (int i = 0; i < referencingKeys.length; i++) {
+        final ref = referencingKeys[i];
+        items.add(PopupMenuItem(
+          value: 'ref_$i',
+          child: Row(
+            children: [
+              const Icon(Icons.hub_rounded, size: 15, color: Color(0xFF10B981)),
+              const SizedBox(width: 8),
+              Text('Ver registros em ${ref.fromTable} (${ref.fromColumn} = $text)', style: textStyle),
+            ],
+          ),
+        ));
+      }
+    }
+
+    if (items.isNotEmpty) items.add(const PopupMenuDivider());
+    items.add(PopupMenuItem(
+      value: 'copy',
+      child: Row(
+        children: [
+          const Icon(Icons.copy_rounded, size: 15, color: Colors.grey),
+          const SizedBox(width: 8),
+          Text('Copiar "$text"', style: textStyle),
+        ],
+      ),
+    ));
+
+    showMenu<String>(
+      context: context,
+      position: RelativeRect.fromLTRB(position.dx, position.dy, position.dx + 1, position.dy + 1),
+      items: items,
+    ).then((val) {
+      if (val == 'navigate_fk' && fk != null) {
+        _navigateForeignKey(fk.toSchema.isEmpty ? currentSchema : fk.toSchema, fk.toTable, fk.toColumn, text);
+      } else if (val != null && val.startsWith('ref_') && referencingKeys != null) {
+        final idx = int.tryParse(val.substring(4));
+        if (idx != null && idx < referencingKeys.length) {
+          final ref = referencingKeys[idx];
+          _navigateReferencingTable(ref.fromSchema.isEmpty ? currentSchema : ref.fromSchema, ref.fromTable, ref.fromColumn, text);
+        }
+      } else if (val == 'copy') {
+        Clipboard.setData(ClipboardData(text: text));
+      }
+    });
+  }
+
   Widget _buildResultsGrid(
     DbQueryResult? result,
     int pageIndex,
     int pageSize,
     Function(int) onPageChange,
-    bool isDark,
-  ) {
+    Function(int) onPageSizeChange,
+    ScrollController verticalController,
+    ScrollController horizontalController,
+    bool isDark, {
+    List<TableForeignKey>? foreignKeys,
+    List<TableForeignKey>? referencingKeys,
+    String? currentSchema,
+    String? currentTable,
+  }) {
     if (result == null) {
       return const Center(child: Text('Nenhum resultado para exibir.'));
     }
@@ -1187,6 +2582,15 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
     final endIndex = (startIndex + pageSize) > totalRows ? totalRows : (startIndex + pageSize);
     final displayedRows = (startIndex < totalRows) ? result.rows.sublist(startIndex, endIndex) : <List<dynamic>>[];
 
+    TableForeignKey? getForeignKeyForColumn(String col) {
+      if (foreignKeys == null || foreignKeys.isEmpty) return null;
+      try {
+        return foreignKeys.firstWhere((fk) => fk.fromColumn.toLowerCase() == col.toLowerCase());
+      } catch (_) {
+        return null;
+      }
+    }
+
     return Column(
       children: [
         // Export Toolbar
@@ -1195,7 +2599,7 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
           color: isDark ? const Color(0xFF162032) : Colors.white,
           child: Row(
             children: [
-              Text('$totalRows registros', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+              Text('$totalRows registros retornados', style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
               const Spacer(),
               TextButton.icon(
                 onPressed: () => _exportCsv(result),
@@ -1212,54 +2616,153 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
         ),
         const Divider(height: 1),
 
-        // Grid Table
+        // Grid Table with 2-axis Visible Scrollbars
         Expanded(
-          child: SingleChildScrollView(
-            scrollDirection: Axis.vertical,
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: DataTable(
-                headingRowHeight: 36,
-                dataRowMinHeight: 32,
-                dataRowMaxHeight: 36,
-                columns: result.columns.map((col) {
-                  return DataColumn(
-                    label: Text(col, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                  );
-                }).toList(),
-                rows: displayedRows.map((row) {
-                  return DataRow(
-                    cells: row.map((cell) {
-                      final text = cell?.toString() ?? 'NULL';
-                      final isNull = cell == null;
-                      return DataCell(
-                        SelectableText(
-                          text,
-                          style: TextStyle(
-                            fontSize: 11.5,
-                            fontFamily: 'monospace',
-                            color: isNull ? Colors.grey : null,
-                            fontStyle: isNull ? FontStyle.italic : FontStyle.normal,
-                          ),
+          child: Scrollbar(
+            controller: horizontalController,
+            thumbVisibility: true,
+            trackVisibility: true,
+            notificationPredicate: (notif) => notif.metrics.axis == Axis.horizontal,
+            child: Scrollbar(
+              controller: verticalController,
+              thumbVisibility: true,
+              trackVisibility: true,
+              notificationPredicate: (notif) => notif.metrics.axis == Axis.vertical,
+              child: SingleChildScrollView(
+                controller: verticalController,
+                scrollDirection: Axis.vertical,
+                child: SingleChildScrollView(
+                  controller: horizontalController,
+                  scrollDirection: Axis.horizontal,
+                  child: DataTable(
+                    headingRowHeight: 36,
+                    dataRowMinHeight: 32,
+                    dataRowMaxHeight: 36,
+                    columns: result.columns.map((col) {
+                      final fk = getForeignKeyForColumn(col);
+                      return DataColumn(
+                        label: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(col, style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
+                            if (fk != null) ...[
+                              const SizedBox(width: 4),
+                              Tooltip(
+                                message: 'Chave Estrangeira: aponta para ${fk.toTable}.${fk.toColumn}',
+                                child: const Icon(Icons.link_rounded, size: 14, color: Color(0xFF38BDF8)),
+                              ),
+                            ],
+                          ],
                         ),
                       );
                     }).toList(),
-                  );
-                }).toList(),
+                    rows: displayedRows.map((row) {
+                      return DataRow(
+                        cells: List.generate(row.length, (colIdx) {
+                          final cell = row[colIdx];
+                          final colName = colIdx < result.columns.length ? result.columns[colIdx] : '';
+                          final fk = getForeignKeyForColumn(colName);
+                          final text = cell?.toString() ?? 'NULL';
+                          final isNull = cell == null;
+
+                          // Foreign Key direct clickable link
+                          if (fk != null && !isNull && text.isNotEmpty && text != 'NULL') {
+                            return DataCell(
+                              InkWell(
+                                borderRadius: BorderRadius.circular(4),
+                                onTap: () => _navigateForeignKey(
+                                  fk.toSchema.isNotEmpty ? fk.toSchema : (currentSchema ?? _selectedSchema),
+                                  fk.toTable,
+                                  fk.toColumn,
+                                  text,
+                                ),
+                                child: Tooltip(
+                                  message: '🔗 Navegar para ${fk.toTable} (${fk.toColumn} = $text)',
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                                    child: Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Text(
+                                          text,
+                                          style: const TextStyle(
+                                            fontSize: 11.5,
+                                            fontFamily: 'monospace',
+                                            color: Color(0xFF38BDF8),
+                                            fontWeight: FontWeight.bold,
+                                            decoration: TextDecoration.underline,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 4),
+                                        const Icon(Icons.open_in_new_rounded, size: 12, color: Color(0xFF38BDF8)),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                          }
+
+                          // Regular cell with context menu on secondary tap for navigation
+                          return DataCell(
+                            GestureDetector(
+                              onSecondaryTapDown: (details) {
+                                _showCellNavigationContextMenu(
+                                  context,
+                                  details.globalPosition,
+                                  text: text,
+                                  column: colName,
+                                  fk: fk,
+                                  referencingKeys: referencingKeys,
+                                  currentSchema: currentSchema ?? _selectedSchema,
+                                );
+                              },
+                              child: SelectableText(
+                                text,
+                                style: TextStyle(
+                                  fontSize: 11.5,
+                                  fontFamily: 'monospace',
+                                  color: isNull ? Colors.grey : null,
+                                  fontStyle: isNull ? FontStyle.italic : FontStyle.normal,
+                                ),
+                              ),
+                            ),
+                          );
+                        }).toList(),
+                      );
+                    }).toList(),
+                  ),
+                ),
               ),
             ),
           ),
         ),
         const Divider(height: 1),
 
-        // Pagination Bar
+        // Pagination Bar with page size selector
         Container(
-          height: 36,
+          height: 38,
           padding: const EdgeInsets.symmetric(horizontal: 14),
           color: isDark ? const Color(0xFF162032) : Colors.white,
           child: Row(
             children: [
-              Text('Exibindo ${startIndex + 1} - $endIndex de $totalRows', style: const TextStyle(fontSize: 11.5, color: Colors.grey)),
+              Text(
+                'Exibindo ${totalRows == 0 ? 0 : startIndex + 1} - $endIndex de $totalRows',
+                style: const TextStyle(fontSize: 11.5, color: Colors.grey),
+              ),
+              const SizedBox(width: 14),
+              DropdownButton<int>(
+                value: pageSize,
+                isDense: true,
+                underline: const SizedBox.shrink(),
+                style: TextStyle(fontSize: 11.5, color: isDark ? Colors.white70 : Colors.black87),
+                items: const [25, 50, 100, 200, 500, 1000].map((size) {
+                  return DropdownMenuItem(value: size, child: Text('$size / pág'));
+                }).toList(),
+                onChanged: (val) {
+                  if (val != null) onPageSizeChange(val);
+                },
+              ),
               const Spacer(),
               IconButton(
                 icon: const Icon(Icons.first_page_rounded, size: 18),
@@ -1269,7 +2772,7 @@ class _DbWorkspacePageState extends State<DbWorkspacePage> {
                 icon: const Icon(Icons.chevron_left_rounded, size: 18),
                 onPressed: pageIndex > 0 ? () => onPageChange(pageIndex - 1) : null,
               ),
-              Text('Página ${pageIndex + 1}', style: const TextStyle(fontSize: 11.5)),
+              Text('Página ${totalRows == 0 ? 0 : pageIndex + 1}', style: const TextStyle(fontSize: 11.5)),
               IconButton(
                 icon: const Icon(Icons.chevron_right_rounded, size: 18),
                 onPressed: endIndex < totalRows ? () => onPageChange(pageIndex + 1) : null,
@@ -1445,9 +2948,19 @@ class _DbConnectionEditorDialogState extends State<DbConnectionEditorDialog> {
       }
     } catch (e) {
       if (mounted) {
+        final errStr = e.toString();
+        String msg;
+        if (e is SocketException || errStr.contains('SocketException') || errStr.contains('errno = 111')) {
+          msg = 'Não foi possível conectar em ${_hostCtrl.text.trim()}:${_portCtrl.text.trim()} (Conexão recusada).\n\n'
+                '• Verifique se o serviço do banco de dados está ativo.\n'
+                '• Confirme se a porta informada está correta (no Docker, use a porta exposta no host).\n'
+                '• Se o banco for local, mantenha "Túnel SSH Integrado" desativado.';
+        } else {
+          msg = 'Erro na conexão: $e';
+        }
         setState(() {
           _testSuccess = false;
-          _testMessage = 'Erro na conexão: $e';
+          _testMessage = msg;
           _isTesting = false;
         });
       }
@@ -2028,3 +3541,42 @@ class _DbConnectionEditorDialogState extends State<DbConnectionEditorDialog> {
     );
   }
 }
+
+List<String> splitSqlStatements(String sql) {
+  final statements = <String>[];
+  final current = StringBuffer();
+  bool inSingleQuote = false;
+  bool inDoubleQuote = false;
+  bool inBacktick = false;
+
+  for (int i = 0; i < sql.length; i++) {
+    final char = sql[i];
+    final prev = i > 0 ? sql[i - 1] : '';
+
+    if (char == "'" && !inDoubleQuote && !inBacktick && prev != r'\') {
+      inSingleQuote = !inSingleQuote;
+    } else if (char == '"' && !inSingleQuote && !inBacktick && prev != r'\') {
+      inDoubleQuote = !inDoubleQuote;
+    } else if (char == '`' && !inSingleQuote && !inDoubleQuote && prev != r'\') {
+      inBacktick = !inBacktick;
+    }
+
+    if (char == ';' && !inSingleQuote && !inDoubleQuote && !inBacktick) {
+      final stmt = current.toString().trim();
+      if (stmt.isNotEmpty) {
+        statements.add(stmt);
+      }
+      current.clear();
+    } else {
+      current.write(char);
+    }
+  }
+
+  final remaining = current.toString().trim();
+  if (remaining.isNotEmpty) {
+    statements.add(remaining);
+  }
+
+  return statements;
+}
+

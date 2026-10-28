@@ -104,6 +104,37 @@ class TableColumnMetadata {
   });
 }
 
+/// Metadata for a Foreign Key relation
+class TableForeignKey {
+  final String constraintName;
+  final String fromSchema;
+  final String fromTable;
+  final String fromColumn;
+  final String toSchema;
+  final String toTable;
+  final String toColumn;
+
+  const TableForeignKey({
+    required this.constraintName,
+    required this.fromSchema,
+    required this.fromTable,
+    required this.fromColumn,
+    required this.toSchema,
+    required this.toTable,
+    required this.toColumn,
+  });
+
+  Map<String, dynamic> toJson() => {
+    'constraintName': constraintName,
+    'fromSchema': fromSchema,
+    'fromTable': fromTable,
+    'fromColumn': fromColumn,
+    'toSchema': toSchema,
+    'toTable': toTable,
+    'toColumn': toColumn,
+  };
+}
+
 /// Query Execution Result
 class DbQueryResult {
   final List<String> columns;
@@ -260,9 +291,13 @@ abstract class DatabaseClient {
   Future<List<String>> listDatabases();
   Future<List<String>> listSchemas();
   Future<List<String>> listTables({String? schema});
+  Future<List<String>> listViews({String? schema});
+  Future<List<String>> listFunctions({String? schema});
   Future<List<TableColumnMetadata>> getTableColumns(String table, {String? schema});
+  Future<List<TableForeignKey>> getTableForeignKeys(String table, {String? schema});
+  Future<List<TableForeignKey>> getReferencingForeignKeys(String table, {String? schema});
   Future<String> getTableDdl(String table, {String? schema});
-  Future<DbQueryResult> executeQuery(String sql, {int maxRows = 200});
+  Future<DbQueryResult> executeQuery(String sql, {int maxRows = 1000});
 
   static DatabaseClient create(
     DbConnectionConfig config, {
@@ -360,6 +395,26 @@ class PostgresDatabaseClient implements DatabaseClient {
   }
 
   @override
+  Future<List<String>> listViews({String? schema}) async {
+    if (_connection == null) await connect();
+    final s = schema ?? 'public';
+    final res = await _connection!.execute(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = '$s' AND table_type = 'VIEW' ORDER BY table_name",
+    );
+    return res.map((r) => r[0].toString()).toList();
+  }
+
+  @override
+  Future<List<String>> listFunctions({String? schema}) async {
+    if (_connection == null) await connect();
+    final s = schema ?? 'public';
+    final res = await _connection!.execute(
+      "SELECT routine_name FROM information_schema.routines WHERE routine_schema = '$s' ORDER BY routine_name",
+    );
+    return res.map((r) => r[0].toString()).toList();
+  }
+
+  @override
   Future<List<TableColumnMetadata>> getTableColumns(String table, {String? schema}) async {
     if (_connection == null) await connect();
     final s = schema ?? 'public';
@@ -407,6 +462,86 @@ class PostgresDatabaseClient implements DatabaseClient {
   }
 
   @override
+  Future<List<TableForeignKey>> getTableForeignKeys(String table, {String? schema}) async {
+    if (_connection == null) await connect();
+    final s = schema ?? 'public';
+    const sql = '''
+      SELECT
+        tc.constraint_name,
+        kcu.table_schema AS from_schema,
+        kcu.table_name AS from_table,
+        kcu.column_name AS from_column,
+        ccu.table_schema AS to_schema,
+        ccu.table_name AS to_table,
+        ccu.column_name AS to_column
+      FROM information_schema.table_constraints AS tc
+      JOIN information_schema.key_column_usage AS kcu
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.constraint_column_usage AS ccu
+        ON ccu.constraint_name = tc.constraint_name
+       AND ccu.table_schema = tc.table_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND tc.table_schema = @s
+        AND tc.table_name = @t
+    ''';
+    try {
+      final res = await _connection!.execute(pg.Sql.named(sql), parameters: {'s': s, 't': table});
+      return res.map((r) => TableForeignKey(
+        constraintName: r[0]?.toString() ?? '',
+        fromSchema: r[1]?.toString() ?? '',
+        fromTable: r[2]?.toString() ?? '',
+        fromColumn: r[3]?.toString() ?? '',
+        toSchema: r[4]?.toString() ?? '',
+        toTable: r[5]?.toString() ?? '',
+        toColumn: r[6]?.toString() ?? '',
+      )).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  @override
+  Future<List<TableForeignKey>> getReferencingForeignKeys(String table, {String? schema}) async {
+    if (_connection == null) await connect();
+    final s = schema ?? 'public';
+    const sql = '''
+      SELECT
+        tc.constraint_name,
+        kcu.table_schema AS from_schema,
+        kcu.table_name AS from_table,
+        kcu.column_name AS from_column,
+        ccu.table_schema AS to_schema,
+        ccu.table_name AS to_table,
+        ccu.column_name AS to_column
+      FROM information_schema.table_constraints AS tc
+      JOIN information_schema.key_column_usage AS kcu
+        ON tc.constraint_name = kcu.constraint_name
+       AND tc.table_schema = kcu.table_schema
+      JOIN information_schema.constraint_column_usage AS ccu
+        ON ccu.constraint_name = tc.constraint_name
+       AND ccu.table_schema = tc.table_schema
+      WHERE tc.constraint_type = 'FOREIGN KEY'
+        AND ccu.table_schema = @s
+        AND ccu.table_name = @t
+    ''';
+    try {
+      final res = await _connection!.execute(pg.Sql.named(sql), parameters: {'s': s, 't': table});
+      return res.map((r) => TableForeignKey(
+        constraintName: r[0]?.toString() ?? '',
+        fromSchema: r[1]?.toString() ?? '',
+        fromTable: r[2]?.toString() ?? '',
+        fromColumn: r[3]?.toString() ?? '',
+        toSchema: r[4]?.toString() ?? '',
+        toTable: r[5]?.toString() ?? '',
+        toColumn: r[6]?.toString() ?? '',
+      )).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  @override
   Future<String> getTableDdl(String table, {String? schema}) async {
     final cols = await getTableColumns(table, schema: schema);
     final s = schema ?? 'public';
@@ -431,7 +566,7 @@ class PostgresDatabaseClient implements DatabaseClient {
   }
 
   @override
-  Future<DbQueryResult> executeQuery(String sql, {int maxRows = 200}) async {
+  Future<DbQueryResult> executeQuery(String sql, {int maxRows = 1000}) async {
     if (_connection == null) await connect();
     final sw = Stopwatch()..start();
     try {
@@ -528,6 +663,26 @@ class MysqlDatabaseClient implements DatabaseClient {
   }
 
   @override
+  Future<List<String>> listViews({String? schema}) async {
+    if (_connection == null) await connect();
+    final db = schema ?? config.databaseName;
+    final res = await _connection!.execute(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = '$db' AND table_type = 'VIEW' ORDER BY table_name",
+    );
+    return res.rows.map((r) => r.assoc().values.first?.toString() ?? '').where((s) => s.isNotEmpty).toList();
+  }
+
+  @override
+  Future<List<String>> listFunctions({String? schema}) async {
+    if (_connection == null) await connect();
+    final db = schema ?? config.databaseName;
+    final res = await _connection!.execute(
+      "SELECT routine_name FROM information_schema.routines WHERE routine_schema = '$db' ORDER BY routine_name",
+    );
+    return res.rows.map((r) => r.assoc().values.first?.toString() ?? '').where((s) => s.isNotEmpty).toList();
+  }
+
+  @override
   Future<List<TableColumnMetadata>> getTableColumns(String table, {String? schema}) async {
     if (_connection == null) await connect();
     final db = schema ?? config.databaseName;
@@ -554,6 +709,87 @@ class MysqlDatabaseClient implements DatabaseClient {
   }
 
   @override
+  Future<List<TableForeignKey>> getTableForeignKeys(String table, {String? schema}) async {
+    if (_connection == null) await connect();
+    final db = schema ?? config.databaseName;
+    final sql = """
+      SELECT 
+        kcu.CONSTRAINT_NAME,
+        kcu.TABLE_SCHEMA AS from_schema,
+        kcu.TABLE_NAME AS from_table,
+        kcu.COLUMN_NAME AS from_column,
+        kcu.REFERENCED_TABLE_SCHEMA AS to_schema,
+        kcu.REFERENCED_TABLE_NAME AS to_table,
+        kcu.REFERENCED_COLUMN_NAME AS to_column
+      FROM information_schema.KEY_COLUMN_USAGE kcu
+      JOIN information_schema.TABLE_CONSTRAINTS tc 
+        ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME 
+       AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
+      WHERE tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
+        AND kcu.TABLE_SCHEMA = '$db'
+        AND kcu.TABLE_NAME = '$table'
+        AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+    """;
+    try {
+      final res = await _connection!.execute(sql);
+      return res.rows.map((r) {
+        final m = r.assoc();
+        return TableForeignKey(
+          constraintName: m['CONSTRAINT_NAME'] ?? m['constraint_name'] ?? '',
+          fromSchema: m['from_schema'] ?? m['FROM_SCHEMA'] ?? '',
+          fromTable: m['from_table'] ?? m['FROM_TABLE'] ?? '',
+          fromColumn: m['from_column'] ?? m['FROM_COLUMN'] ?? '',
+          toSchema: m['to_schema'] ?? m['TO_SCHEMA'] ?? '',
+          toTable: m['to_table'] ?? m['TO_TABLE'] ?? '',
+          toColumn: m['to_column'] ?? m['TO_COLUMN'] ?? '',
+        );
+      }).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  @override
+  Future<List<TableForeignKey>> getReferencingForeignKeys(String table, {String? schema}) async {
+    if (_connection == null) await connect();
+    final db = schema ?? config.databaseName;
+    final sql = """
+      SELECT 
+        kcu.CONSTRAINT_NAME,
+        kcu.TABLE_SCHEMA AS from_schema,
+        kcu.TABLE_NAME AS from_table,
+        kcu.COLUMN_NAME AS from_column,
+        kcu.REFERENCED_TABLE_SCHEMA AS to_schema,
+        kcu.REFERENCED_TABLE_NAME AS to_table,
+        kcu.REFERENCED_COLUMN_NAME AS to_column
+      FROM information_schema.KEY_COLUMN_USAGE kcu
+      JOIN information_schema.TABLE_CONSTRAINTS tc 
+        ON kcu.CONSTRAINT_NAME = tc.CONSTRAINT_NAME 
+       AND kcu.TABLE_SCHEMA = tc.TABLE_SCHEMA
+      WHERE tc.CONSTRAINT_TYPE = 'FOREIGN KEY'
+        AND kcu.REFERENCED_TABLE_SCHEMA = '$db'
+        AND kcu.REFERENCED_TABLE_NAME = '$table'
+    """;
+    try {
+      final res = await _connection!.execute(sql);
+      return res.rows.map((r) {
+        final m = r.assoc();
+        return TableForeignKey(
+          constraintName: m['CONSTRAINT_NAME'] ?? m['constraint_name'] ?? '',
+          fromSchema: m['from_schema'] ?? m['FROM_SCHEMA'] ?? '',
+          fromTable: m['from_table'] ?? m['FROM_TABLE'] ?? '',
+          fromColumn: m['from_column'] ?? m['FROM_COLUMN'] ?? '',
+          toSchema: m['to_schema'] ?? m['TO_SCHEMA'] ?? '',
+          toTable: m['to_table'] ?? m['TO_TABLE'] ?? '',
+          toColumn: m['to_column'] ?? m['TO_COLUMN'] ?? '',
+        );
+      }).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  @override
   Future<String> getTableDdl(String table, {String? schema}) async {
     if (_connection == null) await connect();
     try {
@@ -568,7 +804,7 @@ class MysqlDatabaseClient implements DatabaseClient {
   }
 
   @override
-  Future<DbQueryResult> executeQuery(String sql, {int maxRows = 200}) async {
+  Future<DbQueryResult> executeQuery(String sql, {int maxRows = 1000}) async {
     if (_connection == null) await connect();
     final sw = Stopwatch()..start();
     try {
@@ -674,6 +910,26 @@ class SqlServerDatabaseClient implements DatabaseClient {
   }
 
   @override
+  Future<List<String>> listViews({String? schema}) async {
+    if (_connection == null) await connect();
+    final s = schema ?? 'dbo';
+    final res = await _connection!.query(
+      "SELECT table_name FROM information_schema.tables WHERE table_schema = '$s' AND table_type = 'VIEW' ORDER BY table_name",
+    );
+    return res.rows.map((r) => r['table_name']?.toString() ?? '').toList();
+  }
+
+  @override
+  Future<List<String>> listFunctions({String? schema}) async {
+    if (_connection == null) await connect();
+    final s = schema ?? 'dbo';
+    final res = await _connection!.query(
+      "SELECT routine_name FROM information_schema.routines WHERE routine_schema = '$s' ORDER BY routine_name",
+    );
+    return res.rows.map((r) => r['routine_name']?.toString() ?? '').toList();
+  }
+
+  @override
   Future<List<TableColumnMetadata>> getTableColumns(String table, {String? schema}) async {
     if (_connection == null) await connect();
     final s = schema ?? 'dbo';
@@ -719,6 +975,84 @@ class SqlServerDatabaseClient implements DatabaseClient {
   }
 
   @override
+  Future<List<TableForeignKey>> getTableForeignKeys(String table, {String? schema}) async {
+    if (_connection == null) await connect();
+    final s = schema ?? 'dbo';
+    final sql = """
+      SELECT 
+        fk.name AS constraint_name,
+        s1.name AS from_schema,
+        t1.name AS from_table,
+        c1.name AS from_column,
+        s2.name AS to_schema,
+        t2.name AS to_table,
+        c2.name AS to_column
+      FROM sys.foreign_keys fk
+      INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+      INNER JOIN sys.tables t1 ON fkc.parent_object_id = t1.object_id
+      INNER JOIN sys.schemas s1 ON t1.schema_id = s1.schema_id
+      INNER JOIN sys.columns c1 ON fkc.parent_object_id = c1.object_id AND fkc.parent_column_id = c1.column_id
+      INNER JOIN sys.tables t2 ON fkc.referenced_object_id = t2.object_id
+      INNER JOIN sys.schemas s2 ON t2.schema_id = s2.schema_id
+      INNER JOIN sys.columns c2 ON fkc.referenced_object_id = c2.object_id AND fkc.referenced_column_id = c2.column_id
+      WHERE s1.name = '$s' AND t1.name = '$table'
+    """;
+    try {
+      final res = await _connection!.query(sql);
+      return res.rows.map((r) => TableForeignKey(
+        constraintName: r['constraint_name']?.toString() ?? '',
+        fromSchema: r['from_schema']?.toString() ?? '',
+        fromTable: r['from_table']?.toString() ?? '',
+        fromColumn: r['from_column']?.toString() ?? '',
+        toSchema: r['to_schema']?.toString() ?? '',
+        toTable: r['to_table']?.toString() ?? '',
+        toColumn: r['to_column']?.toString() ?? '',
+      )).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  @override
+  Future<List<TableForeignKey>> getReferencingForeignKeys(String table, {String? schema}) async {
+    if (_connection == null) await connect();
+    final s = schema ?? 'dbo';
+    final sql = """
+      SELECT 
+        fk.name AS constraint_name,
+        s1.name AS from_schema,
+        t1.name AS from_table,
+        c1.name AS from_column,
+        s2.name AS to_schema,
+        t2.name AS to_table,
+        c2.name AS to_column
+      FROM sys.foreign_keys fk
+      INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+      INNER JOIN sys.tables t1 ON fkc.parent_object_id = t1.object_id
+      INNER JOIN sys.schemas s1 ON t1.schema_id = s1.schema_id
+      INNER JOIN sys.columns c1 ON fkc.parent_object_id = c1.object_id AND fkc.parent_column_id = c1.column_id
+      INNER JOIN sys.tables t2 ON fkc.referenced_object_id = t2.object_id
+      INNER JOIN sys.schemas s2 ON t2.schema_id = s2.schema_id
+      INNER JOIN sys.columns c2 ON fkc.referenced_object_id = c2.object_id AND fkc.referenced_column_id = c2.column_id
+      WHERE s2.name = '$s' AND t2.name = '$table'
+    """;
+    try {
+      final res = await _connection!.query(sql);
+      return res.rows.map((r) => TableForeignKey(
+        constraintName: r['constraint_name']?.toString() ?? '',
+        fromSchema: r['from_schema']?.toString() ?? '',
+        fromTable: r['from_table']?.toString() ?? '',
+        fromColumn: r['from_column']?.toString() ?? '',
+        toSchema: r['to_schema']?.toString() ?? '',
+        toTable: r['to_table']?.toString() ?? '',
+        toColumn: r['to_column']?.toString() ?? '',
+      )).toList();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  @override
   Future<String> getTableDdl(String table, {String? schema}) async {
     final cols = await getTableColumns(table, schema: schema);
     final s = schema ?? 'dbo';
@@ -743,7 +1077,7 @@ class SqlServerDatabaseClient implements DatabaseClient {
   }
 
   @override
-  Future<DbQueryResult> executeQuery(String sql, {int maxRows = 200}) async {
+  Future<DbQueryResult> executeQuery(String sql, {int maxRows = 1000}) async {
     if (_connection == null) await connect();
     final sw = Stopwatch()..start();
     try {
